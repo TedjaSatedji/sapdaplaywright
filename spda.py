@@ -151,7 +151,7 @@ async def login_and_attend(playwright, user, course_name):
 
     except Exception as e:
         print(f"❌ Error for {username}: {e}")
-        send_telegram(f"❌ Error during attendance for {username}: {e}", chat_id)
+        send_telegram(f"❌ Error during attendance for {username}", chat_id)
     finally:
         await context.close()
         await browser.close()
