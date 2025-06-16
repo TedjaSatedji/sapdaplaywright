@@ -126,7 +126,8 @@ def save_to_env(chat_id, creds):
         f.write(f"\nSPADA_USERNAME_{index}={creds['username']}")
         f.write(f"\nSPADA_PASSWORD_{index}={creds['password']}")
         f.write(f"\nTELEGRAM_CHAT_ID_{index}={chat_id}")
-        f.write(f"\nSCHEDULE_FILE_{index}={schedule_path}\n\n")
+        f.write(f"\nSCHEDULE_FILE_{index}={schedule_path}")
+        f.write(f"\n")
 
 def delete_credentials(chat_id):
     """Remove user credentials from .env, including the comment and all related lines."""
