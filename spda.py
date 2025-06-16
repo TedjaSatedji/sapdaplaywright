@@ -71,7 +71,7 @@ def get_current_class(schedule):
 
 # --- Playwright Automation ---
 async def login_and_attend(playwright, user, course_name):
-    browser = await playwright.chromium.launch(headless=False)
+    browser = await playwright.chromium.launch(headless=True)
     context = await browser.new_context()
     page = await context.new_page()
 
@@ -128,8 +128,8 @@ async def login_and_attend(playwright, user, course_name):
         await page.wait_for_timeout(2000)
 
         try:
-            await page.click("a:has-text('Submit attendance')")
-            await page.wait_for_selector("label.form-check-label")
+            await page.click("a:has-text('Submit attendance')", timeout=4000)
+            await page.wait_for_selector("label.form-check-label", timeout=4000)
 
             labels = await page.query_selector_all("label.form-check-label")
             for label in labels:
