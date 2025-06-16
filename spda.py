@@ -156,12 +156,18 @@ async def login_and_attend(playwright, user, course_name):
         await context.close()
         await browser.close()
 
+async def limited_login_and_attend(semaphore, playwright, user, course_name):
+    async with semaphore:
+        await login_and_attend(playwright, user, course_name)
+
 # --- Main ---
 async def main():
     users = load_users()
     if not users:
         print("No users found in .env")
         return
+
+    semaphore = asyncio.Semaphore(4)  # Limit to 4 concurrent tasks
 
     async with async_playwright() as playwright:
         tasks = []
@@ -174,8 +180,7 @@ async def main():
             current_class = get_current_class(schedule)
             if current_class:
                 print(f"Current class for {user['username']}: {current_class}")
-                # Each user gets their own login_and_attend task, even if schedule file is the same
-                tasks.append(login_and_attend(playwright, user, current_class))
+                tasks.append(limited_login_and_attend(semaphore, playwright, user, current_class))
             else:
                 print(f"No class at the moment for {user['username']}.")
         if tasks:
