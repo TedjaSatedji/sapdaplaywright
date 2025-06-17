@@ -81,7 +81,16 @@ async def login_and_attend(playwright, user, course_name):
 
     try:
         print(f"Processing attendance for {username}...")
-        await page.goto("https://spada.upnyk.ac.id/login/index.php")
+        for attempt in range(3):
+            try:
+                await page.goto("https://spada.upnyk.ac.id/login/index.php", timeout=60000)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"❌ Failed to load login page for {username} after 3 attempts.")
+                    send_telegram(f"❌ Error loading the page for {username} ask the admin", chat_id)
+                    return
+                await asyncio.sleep(5)
 
         await page.fill("#username", username)
         await page.fill("#password", password)
@@ -151,7 +160,7 @@ async def login_and_attend(playwright, user, course_name):
 
     except Exception as e:
         print(f"❌ Error for {username}: {e}")
-        send_telegram(f"❌ Error during attendance for {username}", chat_id)
+        send_telegram(f"❌ Error during attendance for {username} ask the admin", chat_id)
     finally:
         await context.close()
         await browser.close()
