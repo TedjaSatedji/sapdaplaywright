@@ -60,7 +60,7 @@ There are two ways to add your credentials:
 4. Open Telegram, start your bot, and use `/setup` to save your SPADA credentials.  
    You can use `/me` to check your data, `/delete` to remove it, and `/cancel` to cancel setup.
 
-   - Each user will have their own schedule file created automatically in the `schedules/` folder (e.g., `schedules/schedule_1.csv`).
+   - Each user will have their own schedule file created automatically in the `schedules/` folder (e.g., `schedules/schedule_1.csv`). (you need to fill the schedule manually!)
 
 ---
 
