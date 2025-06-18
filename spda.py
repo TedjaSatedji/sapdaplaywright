@@ -71,7 +71,7 @@ def get_current_class(schedule):
 
 # --- Playwright Automation ---
 async def login_and_attend(playwright, user, course_name):
-    browser = await playwright.chromium.launch(headless=True)
+    browser = await playwright.chromium.launch(headless=False)
     context = await browser.new_context()
     page = await context.new_page()
 
@@ -180,6 +180,7 @@ async def main():
 
     async with async_playwright() as playwright:
         tasks = []
+        delay = 0
         for user in users:
             schedule_path = user["schedule_file"]
             if not os.path.exists(schedule_path):
@@ -189,7 +190,12 @@ async def main():
             current_class = get_current_class(schedule)
             if current_class:
                 print(f"Current class for {user['username']}: {current_class}")
-                tasks.append(limited_login_and_attend(semaphore, playwright, user, current_class))
+                # Stagger start: wrap the call in a coroutine that sleeps before starting
+                async def delayed_task(user=user, current_class=current_class, delay=delay):
+                    await asyncio.sleep(delay)
+                    await limited_login_and_attend(semaphore, playwright, user, current_class)
+                tasks.append(delayed_task())
+                delay += 2  # Stagger each by 2 seconds (adjust as needed)
             else:
                 print(f"No class at the moment for {user['username']}.")
         if tasks:
