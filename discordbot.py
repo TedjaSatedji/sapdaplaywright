@@ -325,7 +325,7 @@ async def schedule(interaction: discord.Interaction):
 @client.event
 async def on_message(message: discord.Message):
     # allow commands to be processed
-    await client.process_commands(message)
+    # await client.process_commands(message)
 
     # only process user uploads when they're in waiting_upload
     user_id = str(message.author.id)
