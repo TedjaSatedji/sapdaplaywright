@@ -31,7 +31,7 @@ pending_csv = {}        # user_id -> csv text awaiting Save/Cancel
 # Gemini
 # ==========================
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-1.5-pro")
+gemini_model = genai.GenerativeModel("gemini-2.0-flash")
 
 def parse_schedule_with_gemini(image_bytes: bytes) -> str:
     """
@@ -40,12 +40,15 @@ def parse_schedule_with_gemini(image_bytes: bytes) -> str:
     """
     image_data = {"mime_type": "image/jpeg", "data": image_bytes}
     prompt = (
-        "Extract the class schedule from this image and return only CSV rows.\n"
-        "Columns must be in this exact order: CourseName,Day,Time.\n"
+        "Extract the class schedule from this image and return only CSV rows. "
+        "Columns must be in this exact order: CourseName,Day,Time. "
         "Example:\n"
+        "CourseName,Day,Time"
         "Matematika,Senin,07:00 - 09:00\n"
         "Fisika,Rabu,10:00 - 12:00\n"
-        "Do not include headers, explanations, or extra text."
+        "Always add column name"
+        "Do not forget the space before and after hyphen for the time"
+        "Do not include, explanations, or extra text."
     )
     resp = gemini_model.generate_content([prompt, image_data])
     return (resp.text or "").strip()
