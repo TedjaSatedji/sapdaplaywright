@@ -48,7 +48,7 @@ def parse_schedule_with_gemini(image_bytes: bytes) -> str:
         "Fisika,Rabu,10:00 - 12:00\n"
         "Always add column name"
         "Do not forget the space before and after hyphen for the time"
-        "Do not include, explanations, or extra text."
+        "Do not include class, explanations, or extra text. only Course Name, Day and Time."
     )
     resp = gemini_model.generate_content([prompt, image_data])
     return (resp.text or "").strip()
