@@ -1,3 +1,15 @@
-selenium
+# core
 python-dotenv
+
+# web automation (if you still need them for SPADA attendance)
+selenium
 playwright
+
+# telegram bot
+python-telegram-bot==20.3
+
+# discord bot
+discord.py==2.3.2
+
+# gemini api
+google-generativeai
