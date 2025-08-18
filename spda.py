@@ -1,5 +1,5 @@
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
 import requests
@@ -93,13 +93,22 @@ def get_current_class(schedule):
         "Thursday": "Kamis", "Friday": "Jumat", "Saturday": "Sabtu", "Sunday": "Minggu"
     }
     today = day_map[now.strftime("%A")]
-    current_time = now.strftime("%H:%M")
+    current_time = now
 
     for entry in schedule:
         if entry["Day"] == today:
-            start_time, end_time = entry["Time"].split(" - ")
-            if start_time <= current_time <= end_time:
+            start_time_str, end_time_str = entry["Time"].split(" - ")
+            start_time = datetime.strptime(start_time_str, "%H:%M").replace(
+                year=current_time.year, month=current_time.month, day=current_time.day
+            )
+            end_time = datetime.strptime(end_time_str, "%H:%M").replace(
+                year=current_time.year, month=current_time.month, day=current_time.day
+            )
+
+            # Only allow attendance if within 15 minutes from start
+            if start_time <= current_time <= start_time + timedelta(minutes=15):
                 return entry["CourseName"]
+
     return None
 
 # --- Playwright Automation ---

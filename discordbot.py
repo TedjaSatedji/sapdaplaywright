@@ -172,7 +172,7 @@ class ScheduleMenu(discord.ui.View):
 
 class ConfirmMenu(discord.ui.View):
     def __init__(self, user_id: str, csv_text: str):
-        super().__init__(timeout=60)
+        super().__init__(timeout=180)
         self.user_id = user_id
         self.csv_text = csv_text
 
