@@ -159,13 +159,13 @@ async def login_and_attend(playwright, user, course_name):
         await course_link.click()
         await page.wait_for_timeout(2000)
 
-        links = await page.query_selector_all("a")
-        att_link = None
-        for link in links:
-            text = (await link.inner_text()).lower()
-            if "presensi" in text or "attendance" in text:
-                att_link = link
+        activities = await page.query_selector_all("li.activity.attendance a")
+        for activity in activities:
+            text = (await activity.inner_text()).lower()
+            if "attendance" in text or "presensi" in text:
+                att_link = activity
                 break
+
 
         if not att_link:
             print(f"No attendance link for {username}")
