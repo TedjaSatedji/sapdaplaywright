@@ -1,123 +1,124 @@
-# Automatic Attendance Script (Work in Progress)
+# 🤖 Automatic Attendance Script (Work in Progress)
 
-Easily automate your attendance process with this script.
-
----
-
-## Features
-
-- **Multiple user support** via `.env` or Telegram bot setup.
-- **Telegram notifications** for attendance status and errors.
-- **Schedule-based attendance** using per-user CSV files.
-- **Concurrent execution** (up to 4 users at a time).
-- **Robust error handling** and retry logic for login and attendance.
+Easily automate your **SPADA attendance** process with support for **Telegram**, **Discord**, and **Gemini AI** for schedule extraction.  
 
 ---
 
-## Getting Started
+## ✨ Features
 
-### 1. Install Dependencies
+- 👥 **Multiple user support** via `.env`, Telegram bot, or Discord bot setup.  
+- 💬 **Telegram & Discord notifications** for attendance status and errors.  
+- 📅 **Schedule-based attendance** using per-user CSV files.  
+- 🖼 **Automatic schedule extraction** from images using **Google Gemini**.  
+- ⚡ **Concurrent execution** (up to 4 users at a time).  
+- 🛡 **Robust error handling** and retry logic for login and attendance.  
 
-Install the dependencies using pip:
+---
+
+## 🚀 Getting Started
+
+### 1️⃣ Install Dependencies
 ```sh
 pip install -r requirements.txt
 ```
 
 ---
 
-### 2. Add Your Credentials
+### 2️⃣ Add Your Credentials
 
-There are two ways to add your credentials:
+You can set up users in three ways:  
 
 #### **A. Manual Method**
-
-1. Create a new `.env` file in the project root.
-2. For each user, add the following variables (increment the number for each user):
-    ```env
-    SPADA_USERNAME_1=your_username
-    SPADA_PASSWORD_1=your_password
-    TELEGRAM_CHAT_ID_1=your_telegram_chat_id
-    SCHEDULE_FILE_1=schedules/schedule_1.csv
-
-    SPADA_USERNAME_2=another_username
-    SPADA_PASSWORD_2=another_password
-    TELEGRAM_CHAT_ID_2=another_telegram_chat_id
-    SCHEDULE_FILE_2=schedules/schedule_2.csv
-    ```
-3. Add your Telegram bot token (only once):
-    ```env
-    TELEGRAM_TOKEN=your_telegram_bot_token
-    ```
-
-#### **B. Telegram Bot Method (Recommended)**
-
-1. [Create a Telegram bot](https://core.telegram.org/bots#6-botfather) and get the bot token.
-2. Add `TELEGRAM_TOKEN=your_telegram_bot_token` to your `.env` file.
-3. Run `telegbot.py`:
-    ```sh
-    python telegbot.py
-    ```
-4. Open Telegram, start your bot, and use `/setup` to save your SPADA credentials.  
-   You can use `/me` to check your data, `/delete` to remove it, and `/cancel` to cancel setup.
-
-   - Each user will have their own schedule file created automatically in the `schedules/` folder (e.g., `schedules/schedule_1.csv`). (you need to fill the schedule manually!)
+1. Create a `.env` file in the project root.  
+2. Add credentials for each user (increment numbers):  
+   ```env
+   SPADA_USERNAME_1=your_username
+   SPADA_PASSWORD_1=your_password
+   TELEGRAM_CHAT_ID_1=your_telegram_chat_id
+   DISCORD_USER_ID_1=your_discord_user_id
+   SCHEDULE_FILE_1=schedules/schedule_1.csv
+   ```
+3. Add bot tokens (once only):  
+   ```env
+   TELEGRAM_TOKEN=your_telegram_bot_token
+   DISCORD_TOKEN=your_discord_bot_token
+   GEMINI_API_KEY=your_gemini_api_key
+   ```
 
 ---
 
-### 3. Add Your Schedule
-
-1. Create a CSV file (e.g., `schedules/schedule_1.csv`) with the following format:
-
-    | CourseName                | Day     | Time           |
-    |---------------------------|---------|----------------|
-    | Data Science Basics       | Senin   | 08:15 - 10:00  |
-    | Web Development           | Selasa  | 13:00 - 15:30  |
-    | Cloud Computing           | Kamis   | 09:45 - 11:15  |
-    | Machine Learning Intro    | Jumat   | 10:30 - 12:00  |
-
-    **CSV Example:**
-    ```csv
-    CourseName,Day,Time
-    Data Science Basics,Senin,08:15 - 10:00
-    Web Development,Selasa,13:00 - 15:30
-    Cloud Computing,Kamis,09:45 - 11:15
-    Machine Learning Intro,Jumat,10:30 - 12:00
-    ```
-
-2. Place the CSV file in the `schedules/` folder.  
-   (If you use the Telegram bot, an empty file will be created for you; just fill it in.)
+#### **B. Telegram Bot Method**
+1. [Create a Telegram bot](https://core.telegram.org/bots#6-botfather).  
+2. Add `TELEGRAM_TOKEN` and `GEMINI_API_KEY` to `.env`.  
+3. Run the bot:
+   ```sh
+   python telegbot.py
+   ```
+4. Use these commands inside Telegram:  
+   - `/setup` → link SPADA credentials  
+   - `/schedule` → upload/view/delete schedule (Gemini can parse from image 📸)  
+   - `/me`, `/delete`, `/cancel` as needed  
 
 ---
 
-### 4. Telegram Notifications
-
-This script sends notifications to your Telegram account using a bot.
-
-- Each user must have their own `TELEGRAM_CHAT_ID` in the `.env` file.
-- The script will send messages for attendance status and errors.
+#### **C. Discord Bot Method**
+1. [Create a Discord bot](https://discord.com/developers/applications).  
+2. Add `DISCORD_TOKEN` and `GEMINI_API_KEY` to `.env`.  
+3. Run the bot:
+   ```sh
+   python discordbot.py
+   ```
+4. Use these commands in Discord:  
+   - `/setup` → link SPADA credentials  
+   - `/schedule` → upload/view/delete schedule (Gemini can parse from image 📸)  
+   - `/me`, `/delete`, `/cancel` as needed  
 
 ---
 
-### 5. Running the Script
+## 📅 Adding Your Schedule
 
-To run the attendance script:
+You can:  
+- 🖼 Upload a schedule **image** via bot → Gemini extracts CSV automatically.  
+- 📄 Or edit the CSV manually in `schedules/`.  
+
+Format:  
+```csv
+CourseName,Day,Time
+Data Science Basics,Senin,08:15 - 10:00
+Web Development,Selasa,13:00 - 15:30
+Cloud Computing,Kamis,09:45 - 11:15
+Machine Learning Intro,Jumat,10:30 - 12:00
+```
+
+---
+
+## 🔔 Notifications
+
+- 📱 If using **Telegram** → notifications arrive in your chat.  
+- 💻 If using **Discord** → notifications arrive in your DMs.  
+
+---
+
+## ▶️ Running the Attendance Script
+
+To run the automation:  
 ```sh
 python spda.py
 ```
 
-- The script will process all users found in the `.env` file.
-- It will check the schedule for each user and submit attendance if a class is currently ongoing.
-- At most **4 users** will be processed concurrently.
+What happens:  
+- ✅ Checks all users in `.env`  
+- ⏰ Detects ongoing classes (only within **15 minutes** of start)  
+- 📝 Submits attendance automatically  
+- ⚡ Handles up to **4 users concurrently**  
 
 ---
 
-### 6. Security Notes
+## 🔒 Security Notes
 
-- **Passwords are stored in plain text** in the `.env` file.  
-  For better security, use unique passwords and do not reuse passwords from other services.
-- The `.env` file should be kept private and not world-readable.
+- ⚠️ Passwords are stored in **plain text**. Please use unique ones.  
+- 🔐 Keep `.env` private and out of version control.  
 
 ---
 
-**Note:**  
-This project is still under development. Contributions and feedback are welcome!
+💡 This project is still under development — feedback & contributions are always welcome!  
