@@ -113,7 +113,7 @@ def get_current_class(schedule):
 
 # --- Playwright Automation ---
 async def login_and_attend(playwright, user, course_name):
-    browser = await playwright.chromium.launch(headless=False)
+    browser = await playwright.chromium.launch(headless=True)
     context = await browser.new_context()
     page = await context.new_page()
 
