@@ -112,16 +112,20 @@ def get_current_class(schedule):
 
     return None
 
-def update_schedule_time(course_name, new_time, schedule_file):
-    """Update the schedule CSV with the actual attendance time."""
+async def update_schedule_time(course_name, new_time, schedule_file, user):
+    """Update the schedule CSV only if time changed, and notify the user."""
     rows = []
     updated = False
+    old_time = None
+
     with open(schedule_file, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
             if row["CourseName"].lower().startswith(course_name.lower()):
-                row["Time"] = new_time
-                updated = True
+                old_time = row["Time"]
+                if row["Time"] != new_time:
+                    row["Time"] = new_time
+                    updated = True
             rows.append(row)
 
     if updated:
@@ -129,9 +133,19 @@ def update_schedule_time(course_name, new_time, schedule_file):
             writer = csv.DictWriter(f, fieldnames=["CourseName", "Day", "Time"])
             writer.writeheader()
             writer.writerows(rows)
-        print(f"⏰ Schedule for {course_name} updated to {new_time} in {schedule_file}")
+
+        msg = f"⏰ Your schedule for *{course_name}* was corrected from **{old_time}** to **{new_time}**."
+        print(msg)
+        await notify_user(msg, user)
 
 # --- Playwright Automation ---
+def normalize_time_str(t: str) -> str:
+    t = t.strip().upper()
+    # If missing minutes (like "10AM"), add ":00"
+    if re.match(r"^\d{1,2}(AM|PM)$", t):
+        t = t.replace("AM", ":00AM").replace("PM", ":00PM")
+    return t
+
 async def login_and_attend(playwright, user, course_name):
     browser = await playwright.chromium.launch(headless=True)
     context = await browser.new_context()
@@ -203,24 +217,14 @@ async def login_and_attend(playwright, user, course_name):
             if len(texts) >= 2:
                 real_time = texts[1]  # second <nobr> contains the time range
                 try:
-                    def normalize_time_str(t: str) -> str:
-                        t = t.strip().upper()
-                        # If missing minutes (like "10AM"), add ":00"
-                        if re.match(r"^\d{1,2}(AM|PM)$", t):
-                            t = t.replace("AM", ":00AM").replace("PM", ":00PM")
-                        return t
-                    
                     start_str, end_str = real_time.split("-")
                     start_str = normalize_time_str(start_str)
                     end_str = normalize_time_str(end_str)
-                    
-                    start_fmt = datetime.strptime(start_str, "%I:%M%p").strftime("%H:%M")
-                    end_fmt = datetime.strptime(end_str, "%I:%M%p").strftime("%H:%M")
-                    
+
+                    start_fmt = datetime.strptime(start_str.strip(), "%I:%M%p").strftime("%H:%M")
+                    end_fmt = datetime.strptime(end_str.strip(), "%I:%M%p").strftime("%H:%M")
                     new_time = f"{start_fmt} - {end_fmt}"
-                    update_schedule_time(course_name, new_time, user["schedule_file"])
-                    print(f"🔄 Synced time for {course_name}: {new_time}")
-                    
+                    await update_schedule_time(course_name, new_time, user["schedule_file"], user)
                 except Exception as e:
                     print(f"⚠️ Failed to parse real time {real_time}: {e}")
                 break
