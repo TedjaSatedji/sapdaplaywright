@@ -1,4 +1,5 @@
 import csv
+import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
@@ -33,6 +34,24 @@ async def send_discord(message, user_id):
     except Exception as e:
         print(f"Failed to send Discord message to {user_id}: {e}")
 
+# --- Telegram ---
+def send_telegram(message, chat_id):
+    if not TELEGRAM_TOKEN or not chat_id:
+        print("Telegram token or chat ID is missing. Skipping notification.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": chat_id, "text": message}
+    try:
+        requests.post(url, data=data)
+    except Exception as e:
+        print(f"Failed to send Telegram message to {chat_id}: {e}")
+
+async def notify_user(message, user):
+    if user.get("use_discord"):
+        await send_discord(message, user["chat_id"])
+    else:
+        send_telegram(message, user["chat_id"])
+
 # --- User Loading ---
 def load_users():
     users = []
@@ -63,24 +82,6 @@ def load_users():
             })
     return users
 
-# --- Telegram Bot ---
-def send_telegram(message, chat_id):
-    if not TELEGRAM_TOKEN or not chat_id:
-        print("Telegram token or chat ID is missing. Skipping notification.")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": chat_id, "text": message}
-    try:
-        requests.post(url, data=data)
-    except Exception as e:
-        print(f"Failed to send Telegram message to {chat_id}: {e}")
-
-async def notify_user(message, user):
-    if user.get("use_discord"):
-        await send_discord(message, user["chat_id"])
-    else:
-        send_telegram(message, user["chat_id"])
-
 # --- Schedule ---
 def load_schedule(csv_file):
     with open(csv_file, newline='', encoding='utf-8') as f:
@@ -105,11 +106,30 @@ def get_current_class(schedule):
                 year=current_time.year, month=current_time.month, day=current_time.day
             )
 
-            # Only allow attendance if within 15 minutes from start
+            # Allow attendance if within 15 minutes of start
             if start_time <= current_time <= start_time + timedelta(minutes=15):
                 return entry["CourseName"]
 
     return None
+
+def update_schedule_time(course_name, new_time, schedule_file):
+    """Update the schedule CSV with the actual attendance time."""
+    rows = []
+    updated = False
+    with open(schedule_file, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["CourseName"].lower().startswith(course_name.lower()):
+                row["Time"] = new_time
+                updated = True
+            rows.append(row)
+
+    if updated:
+        with open(schedule_file, "w", newline='', encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["CourseName", "Day", "Time"])
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"⏰ Schedule for {course_name} updated to {new_time} in {schedule_file}")
 
 # --- Playwright Automation ---
 async def login_and_attend(playwright, user, course_name):
@@ -129,7 +149,7 @@ async def login_and_attend(playwright, user, course_name):
             except Exception as e:
                 if attempt == 2:
                     print(f"❌ Failed to load login page for {username} after 3 attempts.")
-                    await notify_user(f"❌ Error loading the page for {username} ask the admin", user)
+                    await notify_user(f"❌ Error loading the page for {username}, ask the admin.", user)
                     return
                 await asyncio.sleep(5)
 
@@ -160,14 +180,12 @@ async def login_and_attend(playwright, user, course_name):
         await page.wait_for_timeout(2000)
         
         att_link = None
-
         activities = await page.query_selector_all("li.activity.attendance a")
         for activity in activities:
             text = (await activity.inner_text()).lower()
             if "attendance" in text or "presensi" in text:
                 att_link = activity
                 break
-
 
         if not att_link:
             print(f"No attendance link for {username}")
@@ -176,6 +194,36 @@ async def login_and_attend(playwright, user, course_name):
 
         await att_link.click()
         await page.wait_for_timeout(2000)
+
+        # Scrape the <td class="datecol"> cells to get real session time
+        time_cells = await page.query_selector_all("td.datecol")
+        for cell in time_cells:
+            nobrs = await cell.query_selector_all("nobr")
+            texts = [ (await n.inner_text()).strip() for n in nobrs ]
+            if len(texts) >= 2:
+                real_time = texts[1]  # second <nobr> contains the time range
+                try:
+                    def normalize_time_str(t: str) -> str:
+                        t = t.strip().upper()
+                        # If missing minutes (like "10AM"), add ":00"
+                        if re.match(r"^\d{1,2}(AM|PM)$", t):
+                            t = t.replace("AM", ":00AM").replace("PM", ":00PM")
+                        return t
+                    
+                    start_str, end_str = real_time.split("-")
+                    start_str = normalize_time_str(start_str)
+                    end_str = normalize_time_str(end_str)
+                    
+                    start_fmt = datetime.strptime(start_str, "%I:%M%p").strftime("%H:%M")
+                    end_fmt = datetime.strptime(end_str, "%I:%M%p").strftime("%H:%M")
+                    
+                    new_time = f"{start_fmt} - {end_fmt}"
+                    update_schedule_time(course_name, new_time, user["schedule_file"])
+                    print(f"🔄 Synced time for {course_name}: {new_time}")
+                    
+                except Exception as e:
+                    print(f"⚠️ Failed to parse real time {real_time}: {e}")
+                break
 
         try:
             await page.click("a:has-text('Submit attendance')", timeout=4000)
@@ -201,7 +249,7 @@ async def login_and_attend(playwright, user, course_name):
 
     except Exception as e:
         print(f"❌ Error for {username}: {e}")
-        await notify_user(f"❌ Error during attendance for {username} ask the admin", user)
+        await notify_user(f"❌ Error during attendance for {username}, ask the admin.", user)
     finally:
         await context.close()
         await browser.close()
