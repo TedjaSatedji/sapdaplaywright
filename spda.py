@@ -113,7 +113,7 @@ def get_current_class(schedule):
 
 # --- Playwright Automation ---
 async def login_and_attend(playwright, user, course_name):
-    browser = await playwright.chromium.launch(headless=True)
+    browser = await playwright.chromium.launch(headless=False)
     context = await browser.new_context()
     page = await context.new_page()
 
@@ -158,6 +158,8 @@ async def login_and_attend(playwright, user, course_name):
 
         await course_link.click()
         await page.wait_for_timeout(2000)
+        
+        att_link = None
 
         activities = await page.query_selector_all("li.activity.attendance a")
         for activity in activities:
