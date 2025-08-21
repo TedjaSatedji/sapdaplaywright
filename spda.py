@@ -1,3 +1,4 @@
+
 import csv
 import re
 from datetime import datetime, timedelta
@@ -7,6 +8,9 @@ import requests
 import asyncio
 from playwright.async_api import async_playwright
 import discord
+
+FLAG_DIR = "flags"
+os.makedirs(FLAG_DIR, exist_ok=True)
 
 # Load environment variables
 load_dotenv()
@@ -81,6 +85,24 @@ def load_users():
                 "schedule_file": schedule_file
             })
     return users
+
+# --- Pause Check ---
+def is_paused(username: str, course_name: str) -> bool:
+    """Check if attendance should be skipped due to pause flags."""
+    # Indefinite pause
+    pause_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
+    if os.path.exists(pause_file):
+        print(f"⏸️ {username} is paused indefinitely.")
+        return True
+
+    # One-time pause for this class
+    once_file = os.path.join(FLAG_DIR, f"pause_once_{username}_{course_name.replace(' ','_')}.flag")
+    if os.path.exists(once_file):
+        print(f"⏸️ Skipping one class {course_name} for {username}.")
+        os.remove(once_file)  # consume the flag
+        return True
+
+    return False
 
 # --- Schedule ---
 def load_schedule(csv_file):
@@ -263,6 +285,7 @@ async def limited_login_and_attend(semaphore, playwright, user, course_name):
         await login_and_attend(playwright, user, course_name)
 
 # --- Main ---
+
 async def main():
     users = load_users()
     if not users:
@@ -282,6 +305,11 @@ async def main():
             schedule = load_schedule(schedule_path)
             current_class = get_current_class(schedule)
             if current_class:
+                # Check pause before scheduling attendance
+                if is_paused(user["username"], current_class):
+                    await notify_user(f"⏸️ Skipped attendance for {current_class} (paused).", user)
+                    continue
+
                 print(f"Current class for {user['username']}: {current_class}")
                 async def delayed_task(user=user, current_class=current_class, delay=delay):
                     await asyncio.sleep(delay)

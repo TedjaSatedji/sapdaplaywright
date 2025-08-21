@@ -1,70 +1,53 @@
 import os
 import io
-import asyncio
+from datetime import datetime
 from dotenv import load_dotenv
 import discord
 from discord import app_commands
 import google.generativeai as genai
 
 # ==========================
-# Boot
+# Setup
 # ==========================
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ENV_FILE = ".env"
 
+FLAG_DIR = "flags"
+SCHEDULE_DIR = "schedules"
+os.makedirs(FLAG_DIR, exist_ok=True)
+os.makedirs(SCHEDULE_DIR, exist_ok=True)
+
 intents = discord.Intents.default()
-intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 # ==========================
-# State (mirror Telegram's)
-# ==========================
-user_states = {}        # during /setup: user_id -> "awaiting_username"/"awaiting_password"
-user_temp_data = {}     # during /setup: user_id -> {"username": ..., "password": ...}
-waiting_upload = set()  # user_ids expecting an image upload (after pressing Upload)
-pending_csv = {}        # user_id -> csv text awaiting Save/Cancel
-
-# ==========================
-# Gemini
+# Gemini model
 # ==========================
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-2.0-flash")
 
 def parse_schedule_with_gemini(image_bytes: bytes) -> str:
-    """
-    Uses Gemini to parse a schedule image and return CSV rows (no header).
-    Order: CourseName,Day,Time
-    """
     image_data = {"mime_type": "image/jpeg", "data": image_bytes}
     prompt = (
         "Extract the class schedule from this image and return only CSV rows. "
         "Columns must be in this exact order: CourseName,Day,Time. "
         "Example:\n"
-        "CourseName,Day,Time"
+        "CourseName,Day,Time\n"
         "Matematika,Senin,07:00 - 09:00\n"
         "Fisika,Rabu,10:00 - 12:00\n"
-        "Always add column name"
-        "Do not forget the space before and after hyphen for the time"
-        "Do not include class, explanations, or extra text. only Course Name, Day and Time."
+        "Always add column name\n"
+        "Do not forget the space before and after hyphen for the time\n"
+        "Do not include class, explanations, or extra text."
     )
     resp = gemini_model.generate_content([prompt, image_data])
     return (resp.text or "").strip()
 
 # ==========================
-# Helpers (mirror Telegram)
+# ENV helpers
 # ==========================
-def is_user_exist(user_id: str) -> bool:
-    if not os.path.exists(ENV_FILE):
-        return False
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("DISCORD_USER_ID_") and user_id in line:
-                return True
-    return False
-
 def find_user_index_by_id(user_id: str):
     if not os.path.exists(ENV_FILE):
         return None
@@ -72,6 +55,16 @@ def find_user_index_by_id(user_id: str):
         for line in f:
             if line.startswith("DISCORD_USER_ID_") and user_id in line:
                 return line.split("_")[-1].split("=")[0].strip()
+    return None
+
+def find_username_by_id(user_id: str) -> str | None:
+    idx = find_user_index_by_id(user_id)
+    if not idx:
+        return None
+    with open(ENV_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith(f"SPADA_USERNAME_{idx}="):
+                return line.strip().split("=", 1)[1]
     return None
 
 def find_schedule_path(user_id: str) -> str | None:
@@ -96,9 +89,7 @@ def get_next_index():
 
 def save_to_env(user_id: str, creds: dict):
     idx = get_next_index()
-    schedule_dir = "schedules"
-    os.makedirs(schedule_dir, exist_ok=True)
-    schedule_path = f"{schedule_dir}/schedule_{idx}.csv"
+    schedule_path = f"{SCHEDULE_DIR}/schedule_{idx}.csv"
     if not os.path.exists(schedule_path):
         open(schedule_path, "w", encoding="utf-8").close()
     with open(ENV_FILE, "a", encoding="utf-8") as f:
@@ -113,9 +104,9 @@ def delete_credentials(user_id: str) -> bool:
         return False
     with open(ENV_FILE, "r", encoding="utf-8") as f:
         lines = f.readlines()
-    new_lines = []
-    found = False
-    i = 0
+    new_lines, found, i = [], False, 0
+    schedule_path = None
+    username = None
     while i < len(lines):
         if (
             i + 4 < len(lines)
@@ -127,6 +118,9 @@ def delete_credentials(user_id: str) -> bool:
             and user_id in lines[i+3]
         ):
             found = True
+            # Extract username and schedule_path for deletion
+            username = lines[i+1].strip().split("=", 1)[1]
+            schedule_path = lines[i+4].strip().split("=", 1)[1]
             i += 5
         else:
             new_lines.append(lines[i])
@@ -134,239 +128,198 @@ def delete_credentials(user_id: str) -> bool:
     if found:
         with open(ENV_FILE, "w", encoding="utf-8") as f:
             f.writelines(new_lines)
+        # Delete schedule file
+        if schedule_path and os.path.exists(schedule_path):
+            try:
+                os.remove(schedule_path)
+            except Exception:
+                pass
+        # Delete all flag files for this user
+        if username:
+            for f in os.listdir(FLAG_DIR):
+                if f.startswith(f"pause_user_{username}") or f.startswith(f"pause_once_{username}_"):
+                    try:
+                        os.remove(os.path.join(FLAG_DIR, f))
+                    except Exception:
+                        pass
     return found
 
 # ==========================
-# Discord UI (mirrors Telegram inline buttons)
+# Pause helpers
 # ==========================
-class ScheduleMenu(discord.ui.View):
-    def __init__(self, user_id: str):
-        super().__init__(timeout=120)
-        self.user_id = user_id
-
-    @discord.ui.button(label="🖼 Upload Schedule", style=discord.ButtonStyle.primary)
-    async def upload(self, interaction: discord.Interaction, button: discord.ui.Button):
-        waiting_upload.add(self.user_id)
-        # clear any prior pending CSV
-        pending_csv.pop(self.user_id, None)
-        await interaction.response.send_message("🖼 Please send your schedule image now (in this channel or DM me).", ephemeral=True)
-
-    @discord.ui.button(label="📄 View Schedule", style=discord.ButtonStyle.secondary)
-    async def view(self, interaction: discord.Interaction, button: discord.ui.Button):
-        schedule_path = find_schedule_path(self.user_id)
-        if not schedule_path or not os.path.exists(schedule_path) or os.path.getsize(schedule_path) == 0:
-            await interaction.response.send_message("⚠️ No schedule saved yet.", ephemeral=True)
-            return
-        await interaction.response.send_message("📄 Your saved schedule:", file=discord.File(schedule_path), ephemeral=True)
-
-    @discord.ui.button(label="🗑 Delete Schedule", style=discord.ButtonStyle.danger)
-    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
-        schedule_path = find_schedule_path(self.user_id)
-        if schedule_path and os.path.exists(schedule_path):
-            os.remove(schedule_path)
-            # recreate empty file so path stays valid
-            open(schedule_path, "w", encoding="utf-8").close()
-            await interaction.response.send_message("🗑 Schedule deleted.", ephemeral=True)
-        else:
-            await interaction.response.send_message("⚠️ No schedule to delete.", ephemeral=True)
-
-class ConfirmMenu(discord.ui.View):
-    def __init__(self, user_id: str, csv_text: str):
-        super().__init__(timeout=180)
-        self.user_id = user_id
-        self.csv_text = csv_text
-
-    @discord.ui.button(label="✅ Save", style=discord.ButtonStyle.success)
-    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
-        schedule_path = find_schedule_path(self.user_id)
-        if not schedule_path:
-            await interaction.response.send_message("❌ Could not locate your schedule file in .env.", ephemeral=True)
-            return
+def get_next_class(schedule_path: str):
+    if not os.path.exists(schedule_path) or os.path.getsize(schedule_path) == 0:
+        return None
+    now = datetime.now()
+    closest_class, closest_start = None, None
+    with open(schedule_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()[1:]
+    for line in lines:
+        parts = line.strip().split(",")
+        if len(parts) < 3:
+            continue
+        course, day, time_str = parts
         try:
-            with open(schedule_path, "w", encoding="utf-8") as f:
-                f.write(self.csv_text)
-            pending_csv.pop(self.user_id, None)
-            await interaction.response.send_message(f"✅ Schedule saved to `{schedule_path}`", ephemeral=True)
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to save: `{e}`", ephemeral=True)
-
-    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        pending_csv.pop(self.user_id, None)
-        waiting_upload.discard(self.user_id)
-        await interaction.response.send_message("❌ Schedule upload cancelled.", ephemeral=True)
+            start_str, end_str = time_str.split(" - ")
+            start_time = datetime.strptime(start_str, "%H:%M").replace(
+                year=now.year, month=now.month, day=now.day
+            )
+        except:
+            continue
+        if start_time > now:
+            if closest_start is None or start_time < closest_start:
+                closest_start, closest_class = start_time, course
+    return closest_class
 
 # ==========================
-# Slash commands (same as Telegram)
+# Slash Commands
 # ==========================
-@tree.command(name="start", description="Show help / available commands")
-async def start(interaction: discord.Interaction):
-    help_text = (
-        "hi hi~ 💫\n\n"
-        "Here’s what I can do for you:\n"
-        "• /setup - link your SPADA account\n"
-        "• /me - show which SPADA user is linked\n"
-        "• /delete - remove your saved credentials\n"
-        "• /schedule - manage your class schedule (upload/view/delete)\n"
-        "• /cancel - cancel the current setup or pending upload\n\n"
-        "After /setup I'll remind you to upload your schedule with /schedule → Upload Schedule."
+@tree.command(name="help", description="Show a help message with available commands")
+async def help_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "👋 Hello! Here’s what I can do for you:\n"
+        "• **/help** – show this help message\n"
+        "• **/setup** – link your SPADA account\n"
+        "• **/mystatus** – show your SPADA user, schedule, and pause status\n"
+        "• **/pause** – pause attendance indefinitely\n"
+        "• **/resume** – resume attendance if paused\n"
+        "• **/pauseonce** – skip attendance for your next class\n"
+        "• **/delete** – remove your saved credentials\n"
+        "• **/schedule** – upload your class schedule\n",
+        ephemeral=True
     )
-    await interaction.response.send_message(help_text, ephemeral=True)
-
-@tree.command(name="cancel", description="Cancel the current setup or pending upload")
-async def cancel(interaction: discord.Interaction):
-    user_id = str(interaction.user.id)
-    had_any = False
-    if user_states.pop(user_id, None) is not None:
-        had_any = True
-    if user_temp_data.pop(user_id, None) is not None:
-        had_any = True
-    if waiting_upload.discard(user_id) is not None:
-        had_any = True
-    if pending_csv.pop(user_id, None) is not None:
-        had_any = True
-
-    # Always respond similarly to Telegram
-    await interaction.response.send_message("❌ Setup cancelled.", ephemeral=True)
 
 @tree.command(name="setup", description="Link your SPADA account")
-async def setup(interaction: discord.Interaction):
+async def setup(interaction: discord.Interaction, username: str, password: str):
     user_id = str(interaction.user.id)
-    if is_user_exist(user_id):
-        await interaction.response.send_message("⚠️ You already have credentials saved. Use /delete first.", ephemeral=True)
+    if find_username_by_id(user_id):
+        await interaction.response.send_message("⚠️ You already have an account linked. Use /delete to reset.", ephemeral=True)
         return
+    save_to_env(user_id, {"username": username, "password": password})
+    await interaction.response.send_message("✅ Account linked! Now upload your schedule with /schedule.", ephemeral=True)
 
-    # mark state so /cancel can clear it
-    user_states[user_id] = "awaiting_username"
-    await interaction.response.send_message("🟢 What is your SPADA username?", ephemeral=True)
-
-    def check_username(m: discord.Message):
-        return m.author == interaction.user and m.channel == interaction.channel
-
-    try:
-        msg = await client.wait_for("message", check=check_username, timeout=120)
-    except asyncio.TimeoutError:
-        user_states.pop(user_id, None)
-        await interaction.followup.send("❌ Timed out waiting for username.", ephemeral=True)
-        return
-
-    # if user canceled during wait, abort
-    if user_states.get(user_id) != "awaiting_username":
-        await interaction.followup.send("❌ Setup cancelled.", ephemeral=True)
-        return
-
-    username = msg.content.strip()
-    user_temp_data[user_id] = {"username": username}
-    user_states[user_id] = "awaiting_password"
-    await interaction.followup.send("🔐 What is your SPADA password?\n\n⚠️ Stored in plain text. Use a unique password.", ephemeral=True)
-
-    def check_password(m: discord.Message):
-        return m.author == interaction.user and m.channel == interaction.channel
-
-    try:
-        msg = await client.wait_for("message", check=check_password, timeout=120)
-    except asyncio.TimeoutError:
-        user_states.pop(user_id, None)
-        user_temp_data.pop(user_id, None)
-        await interaction.followup.send("❌ Timed out waiting for password.", ephemeral=True)
-        return
-
-    if user_states.get(user_id) != "awaiting_password":
-        await interaction.followup.send("❌ Setup cancelled.", ephemeral=True)
-        return
-
-    password = msg.content.strip()
-    user_temp_data[user_id]["password"] = password
-
-    # Save credentials to .env (same behavior as Telegram)
-    save_to_env(user_id, user_temp_data[user_id])
-    user_states.pop(user_id, None)
-    user_temp_data.pop(user_id, None)
-
-    await interaction.followup.send("✅ Credentials saved!", ephemeral=True)
-    # gentle reminder to upload schedule
-    await interaction.followup.send("💡 Don’t forget to upload your schedule with /schedule → Upload Schedule.", ephemeral=True)
-
-@tree.command(name="me", description="Show which SPADA user is linked")
-async def me(interaction: discord.Interaction):
-    user_id = str(interaction.user.id)
-    if not os.path.exists(ENV_FILE):
-        await interaction.response.send_message("ℹ️ No credentials found for your account.", ephemeral=True)
-        return
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    username = None
-    for i in range(len(lines)):
-        if lines[i].startswith("DISCORD_USER_ID_") and user_id in lines[i]:
-            if i >= 2 and lines[i-2].startswith("SPADA_USERNAME_"):
-                username = lines[i-2].split("=", 1)[1].strip()
-            break
-    if username:
-        await interaction.response.send_message(f"👤 Your SPADA username: `{username}`", ephemeral=True)
-    else:
-        await interaction.response.send_message("ℹ️ No credentials found for your account.", ephemeral=True)
-
-@tree.command(name="delete", description="Remove your saved credentials")
+@tree.command(name="delete", description="Delete your linked account")
 async def delete(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     if delete_credentials(user_id):
-        await interaction.response.send_message("🗑️ Your credentials have been deleted.", ephemeral=True)
+        await interaction.response.send_message("🗑️ Account, schedule, and flags deleted.", ephemeral=True)
     else:
-        await interaction.response.send_message("⚠️ No credentials found for your account.", ephemeral=True)
+        await interaction.response.send_message("⚠️ No account found to delete.", ephemeral=True)
 
-@tree.command(name="schedule", description="Manage your class schedule (upload/view/delete)")
-async def schedule(interaction: discord.Interaction):
+@tree.command(name="schedule", description="Upload your schedule image")
+async def schedule(interaction: discord.Interaction, attachment: discord.Attachment):
     user_id = str(interaction.user.id)
-    if not is_user_exist(user_id):
-        await interaction.response.send_message("⚠️ Please run /setup first.", ephemeral=True)
+    schedule_path = find_schedule_path(user_id)
+    if not schedule_path:
+        await interaction.response.send_message("⚠️ Please link your account first with /setup.", ephemeral=True)
         return
-    await interaction.response.send_message("📌 Manage your schedule:", view=ScheduleMenu(user_id), ephemeral=True)
-
-# ==========================
-# Handle image uploads (same flow as Telegram)
-# ==========================
-@client.event
-async def on_message(message: discord.Message):
-    # allow commands to be processed
-    # await client.process_commands(message)
-
-    # only process user uploads when they're in waiting_upload
-    user_id = str(message.author.id)
-    if user_id not in waiting_upload:
-        return
-    if not message.attachments:
-        return
-
-    attachment = message.attachments[0]
-    if not attachment.filename.lower().endswith((".jpg", ".jpeg", ".png")):
-        await message.channel.send("⚠️ Please upload an image file (png/jpg).", delete_after=8)
-        return
-
-    # consume the upload slot
-    waiting_upload.discard(user_id)
-    await message.channel.send("⏳ Processing your schedule image with Gemini...", delete_after=6)
-
-    image_bytes = await attachment.read()
     try:
-        csv_text = parse_schedule_with_gemini(image_bytes)
-        if not csv_text:
-            await message.channel.send("❌ I couldn't read any schedule from that image. Try a clearer photo?", delete_after=8)
-            return
-
-        pending_csv[user_id] = csv_text
-        csv_file = io.BytesIO(csv_text.encode("utf-8"))
-        csv_file.name = "schedule_preview.csv"
-
-        await message.channel.send(
-            "📄 Here’s the schedule I extracted. Save it?",
-            file=discord.File(csv_file, "schedule_preview.csv"),
-            view=ConfirmMenu(user_id, csv_text)
-        )
+        img_bytes = await attachment.read()
+        csv_data = parse_schedule_with_gemini(img_bytes)
+        with open(schedule_path, "w", encoding="utf-8") as f:
+            f.write(csv_data + "\n")
+        await interaction.response.send_message("✅ Schedule saved!", ephemeral=True)
     except Exception as e:
-        await message.channel.send(f"❌ Error parsing schedule: `{e}`")
+        await interaction.response.send_message(f"❌ Failed to parse schedule: {e}", ephemeral=True)
+
+@tree.command(name="mystatus", description="Show linked SPADA account info and pause state")
+async def mystatus(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    username = find_username_by_id(user_id)
+    schedule_path = find_schedule_path(user_id)
+
+    if not username:
+        await interaction.response.send_message("⚠️ No linked SPADA user found.", ephemeral=True)
+        return
+
+    pause_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
+    if os.path.exists(pause_file):
+        pause_state = "⏸️ Paused indefinitely"
+    else:
+        once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
+        if once_flags:
+            paused_class = once_flags[0].replace(f"pause_once_{username}_", "").replace(".flag", "").replace("_", " ")
+            pause_state = f"⏸️ Next class ({paused_class}) will be skipped"
+        else:
+            pause_state = "▶️ Active"
+
+    msg = (
+        f"👤 **SPADA User:** {username}\n"
+        f"📂 **Schedule:** {schedule_path if schedule_path else 'not linked'}\n"
+        f"⏱️ **Status:** {pause_state}"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@tree.command(name="pause", description="Pause attendance indefinitely")
+async def pause(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    username = find_username_by_id(user_id)
+    if not username:
+        await interaction.response.send_message("⚠️ No linked SPADA user found.", ephemeral=True)
+        return
+    flag_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
+    # Prevent pausing indefinitely if already paused indefinitely
+    if os.path.exists(flag_file):
+        await interaction.response.send_message("⚠️ You are already paused indefinitely. Use /resume to clear it before pausing again.", ephemeral=True)
+        return
+    # Prevent pausing indefinitely if a pause_once flag exists
+    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
+    if once_flags:
+        await interaction.response.send_message("⚠️ You have a one-time pause active. Use /resume to clear it before pausing indefinitely.", ephemeral=True)
+        return
+    with open(flag_file, "w") as f:
+        f.write("paused")
+    await interaction.response.send_message("⏸️ Attendance paused indefinitely. Use /resume to re-enable.", ephemeral=True)
+
+@tree.command(name="resume", description="Resume attendance if paused")
+async def resume(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    username = find_username_by_id(user_id)
+    if not username:
+        await interaction.response.send_message("⚠️ No linked SPADA user found.", ephemeral=True)
+        return
+    flag_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
+    # Remove indefinite pause flag
+    if os.path.exists(flag_file):
+        os.remove(flag_file)
+    # Remove any pause_once flags for this user
+    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
+    for f in once_flags:
+        try:
+            os.remove(os.path.join(FLAG_DIR, f))
+        except Exception:
+            pass
+    await interaction.response.send_message("▶️ Attendance resumed.", ephemeral=True)
+
+@tree.command(name="pauseonce", description="Pause attendance for your next upcoming class only")
+async def pauseonce(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    username = find_username_by_id(user_id)
+    schedule_path = find_schedule_path(user_id)
+    if not username or not schedule_path:
+        await interaction.response.send_message("⚠️ No linked SPADA user or schedule.", ephemeral=True)
+        return
+    # Prevent pausing once if already paused indefinitely
+    indefinite_flag = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
+    if os.path.exists(indefinite_flag):
+        await interaction.response.send_message("⚠️ You are already paused indefinitely. Use /resume to clear it before pausing once.", ephemeral=True)
+        return
+    # Prevent pausing once if a pause_once flag already exists
+    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
+    if once_flags:
+        await interaction.response.send_message("⚠️ You already have a one-time pause active. Use /resume to clear it before pausing once again.", ephemeral=True)
+        return
+    next_class = get_next_class(schedule_path)
+    if not next_class:
+        await interaction.response.send_message("ℹ️ No upcoming class found to pause.", ephemeral=True)
+        return
+    flag_file = os.path.join(FLAG_DIR, f"pause_once_{username}_{next_class.replace(' ','_')}.flag")
+    with open(flag_file, "w") as f:
+        f.write("skip next")
+    await interaction.response.send_message(f"⏸️ Next class **{next_class}** will be skipped.", ephemeral=True)
 
 # ==========================
-# Boot & sync
+# Boot
 # ==========================
 @client.event
 async def on_ready():

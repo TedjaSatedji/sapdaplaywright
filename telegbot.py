@@ -4,6 +4,10 @@ from dotenv import load_dotenv
 import telebot
 from telebot import types
 import google.generativeai as genai
+from datetime import datetime
+
+FLAG_DIR = "flags"
+os.makedirs(FLAG_DIR, exist_ok=True)
 
 # =============================
 # Boot
@@ -118,6 +122,8 @@ def delete_credentials(chat_id: str) -> bool:
     new_lines = []
     found = False
     i = 0
+    schedule_path = None
+    username = None
     while i < len(lines):
         if (
             i + 4 < len(lines)
@@ -129,6 +135,8 @@ def delete_credentials(chat_id: str) -> bool:
             and chat_id in lines[i+3]
         ):
             found = True
+            username = lines[i+1].strip().split("=", 1)[1]
+            schedule_path = lines[i+4].strip().split("=", 1)[1]
             i += 5  # skip this block
         else:
             new_lines.append(lines[i])
@@ -136,6 +144,20 @@ def delete_credentials(chat_id: str) -> bool:
     if found:
         with open(ENV_FILE, "w", encoding="utf-8") as f:
             f.writelines(new_lines)
+        # Delete schedule file
+        if schedule_path and os.path.exists(schedule_path):
+            try:
+                os.remove(schedule_path)
+            except Exception:
+                pass
+        # Delete all flag files for this user
+        if username:
+            for f in os.listdir(FLAG_DIR):
+                if f.startswith(f"pause_user_{username}") or f.startswith(f"pause_once_{username}_"):
+                    try:
+                        os.remove(os.path.join(FLAG_DIR, f))
+                    except Exception:
+                        pass
     return found
 
 def schedule_menu_markup():
@@ -155,41 +177,94 @@ def confirm_menu_markup():
     )
     return kb
 
+def find_username_by_chat(chat_id: str) -> str | None:
+    if not os.path.exists(ENV_FILE):
+        return None
+    with open(ENV_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    for i, line in enumerate(lines):
+        if line.startswith("TELEGRAM_CHAT_ID_") and chat_id in line:
+            if i >= 2 and lines[i-2].startswith("SPADA_USERNAME_"):
+                return lines[i-2].split("=", 1)[1].strip()
+    return None
+
+def get_next_class(schedule_path: str):
+    if not os.path.exists(schedule_path) or os.path.getsize(schedule_path) == 0:
+        return None
+    now = datetime.now()
+    closest_class = None
+    closest_start = None
+    with open(schedule_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()[1:]  # skip header
+    for line in lines:
+        parts = line.strip().split(",")
+        if len(parts) < 3:
+            continue
+        course, day, time_str = parts
+        start_str, end_str = time_str.split(" - ")
+        try:
+            start_time = datetime.strptime(start_str, "%H:%M").replace(
+                year=now.year, month=now.month, day=now.day
+            )
+        except:
+            continue
+        if start_time > now:
+            if closest_start is None or start_time < closest_start:
+                closest_start = start_time
+                closest_class = course
+    return closest_class
+
 # =============================
 # Commands
 # =============================
-@bot.message_handler(commands=["start"])
-def handle_start(message):
+@bot.message_handler(commands=["help"])
+def handle_help(message):
     bot.send_message(
         message.chat.id,
         "hi hi~ 💫\n\n"
         "Here’s what I can do for you:\n"
+        "• <b>/help</b> – show this help message\n"
         "• <b>/setup</b> – link your SPADA account\n"
-        "• <b>/me</b> – show which SPADA user is linked\n"
+        "• <b>/mystatus</b> – show your SPADA user, schedule, and pause status\n"
+        "• <b>/pause</b> – pause attendance indefinitely\n"
+        "• <b>/resume</b> – resume attendance if paused\n"
+        "• <b>/pauseonce</b> – skip attendance for your next class\n"
         "• <b>/delete</b> – remove your saved credentials\n"
         "• <b>/schedule</b> – manage your class schedule (upload/view/delete)\n"
         "• <b>/cancel</b> – cancel any ongoing action\n"
     )
 
-@bot.message_handler(commands=["me"])
-def handle_me(message):
+@bot.message_handler(commands=["mystatus"])
+def cmd_mystatus(message):
     chat_id = str(message.chat.id)
-    if not os.path.exists(ENV_FILE):
-        bot.send_message(chat_id, "ℹ️ no credentials found.")
-        return
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    username = None
-    for i in range(len(lines)):
-        if lines[i].startswith("TELEGRAM_CHAT_ID_") and chat_id in lines[i]:
-            if i >= 2 and lines[i-2].startswith("SPADA_USERNAME_"):
-                username = lines[i-2].split("=", 1)[1].strip()
-            break
-    if username:
-        bot.send_message(chat_id, f"👤 linked SPADA username: <code>{username}</code>")
-    else:
-        bot.send_message(chat_id, "ℹ️ no credentials found for this chat.")
+    username = find_username_by_chat(chat_id)
+    schedule_path = find_schedule_path(chat_id)
 
+    if not username:
+        bot.send_message(chat_id, "⚠️ No linked SPADA user found.")
+        return
+
+    # Check pause states
+    pause_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
+    pause_state = "▶️ Active"
+    if os.path.exists(pause_file):
+        pause_state = "⏸️ Paused indefinitely"
+    else:
+        # Check for any pause_once flags
+        once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
+        if once_flags:
+            paused_class = once_flags[0].replace(f"pause_once_{username}_", "").replace(".flag", "").replace("_", " ")
+            pause_state = f"⏸️ Next class ({paused_class}) will be skipped"
+
+    # Build status message
+    msg = (
+        f"👤 <b>SPADA User:</b> {username}\n"
+        f"📂 <b>Schedule:</b> {schedule_path if schedule_path else 'not linked'}\n"
+        f"⏱️ <b>Status:</b> {pause_state}"
+    )
+
+    bot.send_message(chat_id, msg, parse_mode="HTML")
+    
 @bot.message_handler(commands=["setup"])
 def handle_setup(message):
     chat_id = str(message.chat.id)
@@ -212,7 +287,7 @@ def cancel(message):
 def handle_delete(message):
     chat_id = str(message.chat.id)
     if delete_credentials(chat_id):
-        bot.send_message(chat_id, "🗑️ credentials deleted. poof~")
+        bot.send_message(chat_id, "🗑️ credentials, schedule, and flags deleted. poof~")
     else:
         bot.send_message(chat_id, "⚠️ no credentials found to delete.")
 
@@ -223,6 +298,75 @@ def handle_schedule(message):
         bot.send_message(chat_id, "⚠️ run /setup first so i can link your schedule~")
         return
     bot.send_message(chat_id, "📌 manage your schedule:", reply_markup=schedule_menu_markup())
+    
+@bot.message_handler(commands=["pause"])
+def cmd_pause(message):
+    chat_id = str(message.chat.id)
+    username = find_username_by_chat(chat_id)
+    if not username:
+        bot.send_message(chat_id, "⚠️ no linked SPADA user found.")
+        return
+    flag_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
+    # Prevent pausing indefinitely if already paused indefinitely
+    if os.path.exists(flag_file):
+        bot.send_message(chat_id, "⚠️ you are already paused indefinitely. Use /resume to clear it before pausing again.")
+        return
+    # Prevent pausing indefinitely if a pause_once flag exists
+    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
+    if once_flags:
+        bot.send_message(chat_id, "⚠️ you have a one-time pause active. Use /resume to clear it before pausing indefinitely.")
+        return
+    with open(flag_file, "w") as f:
+        f.write("paused")
+    bot.send_message(chat_id, "⏸️ attendance paused indefinitely. use /resume to re-enable.")
+
+@bot.message_handler(commands=["resume"])
+def cmd_resume(message):
+    chat_id = str(message.chat.id)
+    username = find_username_by_chat(chat_id)
+    if not username:
+        bot.send_message(chat_id, "⚠️ no linked SPADA user found.")
+        return
+    flag_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
+    # Remove indefinite pause flag
+    if os.path.exists(flag_file):
+        os.remove(flag_file)
+    # Remove any pause_once flags for this user
+    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
+    for f in once_flags:
+        try:
+            os.remove(os.path.join(FLAG_DIR, f))
+        except Exception:
+            pass
+    bot.send_message(chat_id, "▶️ attendance resumed.")
+
+@bot.message_handler(commands=["pauseonce"])
+def cmd_pauseonce(message):
+    chat_id = str(message.chat.id)
+    username = find_username_by_chat(chat_id)
+    schedule_path = find_schedule_path(chat_id)
+    if not username or not schedule_path:
+        bot.send_message(chat_id, "⚠️ no linked SPADA user or schedule.")
+        return
+    # Prevent pausing once if already paused indefinitely
+    indefinite_flag = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
+    if os.path.exists(indefinite_flag):
+        bot.send_message(chat_id, "⚠️ you are already paused indefinitely. Use /resume to clear it before pausing once.")
+        return
+    # Prevent pausing once if a pause_once flag already exists
+    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
+    if once_flags:
+        bot.send_message(chat_id, "⚠️ you already have a one-time pause active. Use /resume to clear it before pausing once again.")
+        return
+    next_class = get_next_class(schedule_path)
+    if not next_class:
+        bot.send_message(chat_id, "ℹ️ no upcoming class found to pause.")
+        return
+    flag_file = os.path.join(FLAG_DIR, f"pause_once_{username}_{next_class.replace(' ','_')}.flag")
+    with open(flag_file, "w") as f:
+        f.write("skip next")
+    bot.send_message(chat_id, f"⏸️ next class <b>{next_class}</b> will be skipped.")
+
 
 # =============================
 # Setup conversation flow
