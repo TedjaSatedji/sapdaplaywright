@@ -164,6 +164,7 @@ def schedule_menu_markup():
     kb = types.InlineKeyboardMarkup()
     kb.add(
         types.InlineKeyboardButton("🖼 Upload Schedule", callback_data="sch_upload"),
+        types.InlineKeyboardButton("⬆️ Upload CSV", callback_data="sch_upload_csv"),
         types.InlineKeyboardButton("📄 View Schedule", callback_data="sch_view"),
     )
     kb.add(types.InlineKeyboardButton("🗑 Delete Schedule", callback_data="sch_delete"))
@@ -397,6 +398,8 @@ def handle_conversation(message):
 # =============================
 # Photo handling (Upload flow)
 # =============================
+
+# Handle photo upload (image schedule)
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     chat_id = str(message.chat.id)
@@ -433,10 +436,51 @@ def handle_photo(message):
         waiting_upload.discard(chat_id)
         bot.send_message(chat_id, f"❌ error parsing schedule: <code>{e}</code>")
 
+# Handle CSV upload
+@bot.message_handler(content_types=["document"])
+def handle_csv_upload(message):
+    chat_id = str(message.chat.id)
+    # Only accept CSV if user pressed "Upload CSV" first
+    if f"csv_{chat_id}" not in waiting_upload:
+        return
+    if not is_chat_id_exist(chat_id):
+        bot.send_message(chat_id, "⚠️ run /setup first before sending your schedule.")
+        return
+    doc = message.document
+    if not doc.file_name.lower().endswith(".csv"):
+        bot.send_message(chat_id, "⚠️ please upload a CSV file.")
+        return
+    try:
+        file_info = bot.get_file(doc.file_id)
+        csv_bytes = bot.download_file(file_info.file_path)
+        csv_text = csv_bytes.decode("utf-8")
+        # Basic validation: must have header and at least one row
+        lines = [l for l in csv_text.strip().splitlines() if l.strip()]
+        if not lines or not lines[0].lower().startswith("coursename,day,time"):
+            bot.send_message(chat_id, "❌ CSV must start with header: CourseName,Day,Time")
+            waiting_upload.discard(f"csv_{chat_id}")
+            return
+        if len(lines) < 2:
+            bot.send_message(chat_id, "❌ CSV must have at least one schedule row.")
+            waiting_upload.discard(f"csv_{chat_id}")
+            return
+        schedule_path = find_schedule_path(chat_id)
+        if not schedule_path:
+            bot.send_message(chat_id, "❌ could not locate your schedule file in .env.")
+            waiting_upload.discard(f"csv_{chat_id}")
+            return
+        with open(schedule_path, "w", encoding="utf-8") as f:
+            f.write(csv_text if csv_text.endswith("\n") else csv_text + "\n")
+        bot.send_message(chat_id, f"✅ schedule CSV uploaded and saved to <code>{schedule_path}</code>")
+        waiting_upload.discard(f"csv_{chat_id}")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ error processing CSV: <code>{e}</code>")
+        waiting_upload.discard(f"csv_{chat_id}")
+
 # =============================
 # Callback handlers (Inline buttons)
 # =============================
-@bot.callback_query_handler(func=lambda c: c.data in ["sch_upload", "sch_view", "sch_delete", "sch_save", "sch_cancel"])
+@bot.callback_query_handler(func=lambda c: c.data in ["sch_upload", "sch_upload_csv", "sch_view", "sch_delete", "sch_save", "sch_cancel"])
 def handle_schedule_buttons(call: types.CallbackQuery):
     chat_id = str(call.message.chat.id)
     data = call.data
@@ -446,13 +490,22 @@ def handle_schedule_buttons(call: types.CallbackQuery):
         bot.answer_callback_query(call.id, "Please run /setup first.")
         return
 
-    # Upload request
+
+    # Upload image request
     if data == "sch_upload":
         waiting_upload.add(chat_id)
         pending_csv.pop(chat_id, None)
         bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
         bot.answer_callback_query(call.id, "Ready for your image!")
         bot.send_message(chat_id, "🖼 please send me your <b>schedule image</b> now.")
+
+    # Upload CSV request
+    elif data == "sch_upload_csv":
+        waiting_upload.add(f"csv_{chat_id}")
+        pending_csv.pop(chat_id, None)
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+        bot.answer_callback_query(call.id, "Ready for your CSV!")
+        bot.send_message(chat_id, "⬆️ please send me your <b>CSV schedule file</b> now.")
 
     # View current schedule
     elif data == "sch_view":
