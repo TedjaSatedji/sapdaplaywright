@@ -153,6 +153,19 @@ def delete_credentials(user_id: str) -> bool:
                         pass
     return found
 
+
+
+#dm helper
+
+async def dm_then_hint(interaction: discord.Interaction, *, content=None, file=None, view=None):
+    # show the server-side hint (ephemeral)
+    if not interaction.response.is_done():
+        await interaction.response.send_message("i DMed you, continue there", ephemeral=True)
+    else:
+        await interaction.followup.send("i DMed you, continue there", ephemeral=True)
+    # DM the actual payload
+    await interaction.user.send(content=content, file=file, view=view)
+
 # ==========================
 # Pause helpers
 # ==========================
@@ -260,10 +273,10 @@ class ConfirmMenu(discord.ui.View):
 # ==========================
 # Slash commands (DM-only behavior)
 # ==========================
-@tree.command(name="start", description="Show help / available commands")
-async def start(interaction: discord.Interaction):
-    await dm_only_ack(interaction, content=(
-        "Hello! Here’s what I can do for you:\n"
+@tree.command(name="help", description="Show a help message with available commands")
+async def help_command(interaction: discord.Interaction):
+    await dm_then_hint(interaction, content=(
+        "Here’s what I can do for you:\n"
         "• **/help** – show this help message\n"
         "• **/setup** – link your SPADA account\n"
         "• **/mystatus** – show your SPADA user, schedule, and pause status\n"
@@ -274,9 +287,11 @@ async def start(interaction: discord.Interaction):
         "• **/schedule** – upload your class schedule\n"
     ))
 
-@tree.command(name="help", description="Show a help message with available commands")
-async def help_command(interaction: discord.Interaction):
-    await start(interaction)
+
+# 4) For EACH of your other commands, send the hint then DM.
+#    Replace their current interaction.response.send_message(...) bodies
+#    with dm_then_hint(...) + the actual DM content.
+#    Below are ready-to-paste versions:
 
 @tree.command(name="cancel", description="Cancel the current setup or pending upload")
 async def cancel(interaction: discord.Interaction):
@@ -285,23 +300,24 @@ async def cancel(interaction: discord.Interaction):
     user_temp_data.pop(user_id, None)
     waiting_upload.discard(user_id)
     pending_csv.pop(user_id, None)
-    await dm_only_ack(interaction, content="Cancelled.")
+    await dm_then_hint(interaction, content="Cancelled.")
+
 
 @tree.command(name="setup", description="Link your SPADA account (guided)")
 async def setup(interaction: discord.Interaction):
     user = interaction.user
     user_id = str(user.id)
-
     if find_username_by_id(user_id):
-        await dm_only_ack(interaction, content="You already have an account linked. Use /delete first.")
+        await dm_then_hint(interaction, content="You already have an account linked. Use /delete first.")
         return
 
-    # ensure DM channel
+    # show server hint, then continue entirely in DM
+    await dm_then_hint(interaction, content="Let’s set you up. I’ll ask in DMs.")
     await user.create_dm()
     dm = user.dm_channel
 
     user_states[user_id] = "awaiting_username"
-    await dm_only_ack(interaction, content="What is your SPADA username?")
+    await user.send("What is your SPADA username?")
 
     def check_u(m: discord.Message):
         return m.author == user and m.channel == dm
@@ -347,14 +363,14 @@ async def setup(interaction: discord.Interaction):
     await user.send("Credentials saved!")
     await user.send("Don’t forget to upload your schedule with /schedule → Upload Schedule.")
 
+
 @tree.command(name="mystatus", description="Show linked SPADA account info and pause state")
 async def mystatus(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     username = find_username_by_id(user_id)
     schedule_path = find_schedule_path(user_id)
-
     if not username:
-        await dm_only_ack(interaction, content="No linked SPADA user found.")
+        await dm_then_hint(interaction, content="No linked SPADA user found.")
         return
 
     pause_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
@@ -373,33 +389,35 @@ async def mystatus(interaction: discord.Interaction):
         f"📂 **Schedule:** {schedule_path if schedule_path else 'not linked'}\n"
         f"⏱️ **Status:** {pause_state}"
     )
-    await dm_only_ack(interaction, content=msg)
+    await dm_then_hint(interaction, content=msg)
+
 
 @tree.command(name="pause", description="Pause attendance indefinitely")
 async def pause(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     username = find_username_by_id(user_id)
     if not username:
-        await dm_only_ack(interaction, content="No linked SPADA user found.")
+        await dm_then_hint(interaction, content="No linked SPADA user found.")
         return
     flag_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
     if os.path.exists(flag_file):
-        await dm_only_ack(interaction, content="Already paused indefinitely. Use /resume to clear it.")
+        await dm_then_hint(interaction, content="Already paused indefinitely. Use /resume to clear it.")
         return
     once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
     if once_flags:
-        await dm_only_ack(interaction, content="You have a one-time pause active. Use /resume first.")
+        await dm_then_hint(interaction, content="You have a one-time pause active. Use /resume first.")
         return
     with open(flag_file, "w") as f:
         f.write("paused")
-    await dm_only_ack(interaction, content="Attendance paused indefinitely. Use /resume to re-enable.")
+    await dm_then_hint(interaction, content="Attendance paused indefinitely. Use /resume to re-enable.")
+
 
 @tree.command(name="resume", description="Resume attendance if paused")
 async def resume(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     username = find_username_by_id(user_id)
     if not username:
-        await dm_only_ack(interaction, content="No linked SPADA user found.")
+        await dm_then_hint(interaction, content="No linked SPADA user found.")
         return
     flag_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
     if os.path.exists(flag_file):
@@ -413,7 +431,8 @@ async def resume(interaction: discord.Interaction):
             os.remove(os.path.join(FLAG_DIR, fpath))
         except Exception:
             pass
-    await dm_only_ack(interaction, content="Attendance resumed.")
+    await dm_then_hint(interaction, content="Attendance resumed.")
+
 
 @tree.command(name="pauseonce", description="Pause attendance for your next upcoming class only")
 async def pauseonce(interaction: discord.Interaction):
@@ -421,41 +440,45 @@ async def pauseonce(interaction: discord.Interaction):
     username = find_username_by_id(user_id)
     schedule_path = find_schedule_path(user_id)
     if not username or not schedule_path:
-        await dm_only_ack(interaction, content="No linked SPADA user or schedule.")
+        await dm_then_hint(interaction, content="No linked SPADA user or schedule.")
         return
     indefinite_flag = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
     if os.path.exists(indefinite_flag):
-        await dm_only_ack(interaction, content="You are paused indefinitely. Use /resume first.")
+        await dm_then_hint(interaction, content="You are paused indefinitely. Use /resume first.")
         return
     once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
     if once_flags:
-        await dm_only_ack(interaction, content="You already have a one-time pause active. Use /resume first.")
+        await dm_then_hint(interaction, content="You already have a one-time pause active. Use /resume first.")
         return
     next_class = get_next_class(schedule_path)
     if not next_class:
-        await dm_only_ack(interaction, content="No upcoming class found to pause.")
+        await dm_then_hint(interaction, content="No upcoming class found to pause.")
         return
     flag_file = os.path.join(FLAG_DIR, f"pause_once_{username}_{next_class.replace(' ', '_')}.flag")
     with open(flag_file, "w") as f:
         f.write("skip next")
-    await dm_only_ack(interaction, content=f"Next class **{next_class}** will be skipped.")
+    await dm_then_hint(interaction, content=f"Next class **{next_class}** will be skipped.")
+
 
 @tree.command(name="delete", description="Remove your saved credentials (also deletes schedule & pause flags)")
 async def delete(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     if delete_credentials(user_id):
-        await dm_only_ack(interaction, content="Account, schedule, and flags deleted.")
+        await dm_then_hint(interaction, content="Account, schedule, and flags deleted.")
     else:
-        await dm_only_ack(interaction, content="No account found to delete.")
+        await dm_then_hint(interaction, content="No account found to delete.")
+
 
 @tree.command(name="schedule", description="Manage your class schedule (upload/view/delete)")
 async def schedule(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     if not find_username_by_id(user_id):
-        await dm_only_ack(interaction, content="Please run /setup first.")
+        await dm_then_hint(interaction, content="Please run /setup first.")
         return
+    # send the menu in DM; show server hint
     view = ScheduleMenu(user_id)
-    await dm_only_ack(interaction, content="Manage your schedule:", view=view)
+    await dm_then_hint(interaction, content="Manage your schedule:", view=view)
+
 
 # ==========================
 # Handle uploads/messages — DM only
