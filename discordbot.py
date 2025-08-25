@@ -158,12 +158,14 @@ def delete_credentials(user_id: str) -> bool:
 #dm helper
 
 async def dm_then_hint(interaction: discord.Interaction, *, content=None, file=None, view=None):
-    # show the server-side hint (ephemeral)
-    if not interaction.response.is_done():
-        await interaction.response.send_message("i DMed you, continue there", ephemeral=True)
-    else:
-        await interaction.followup.send("i DMed you, continue there", ephemeral=True)
-    # DM the actual payload
+    # if command is invoked in a guild, show ephemeral hint
+    if not isinstance(interaction.channel, discord.DMChannel):
+        if not interaction.response.is_done():
+            await interaction.response.send_message("i DMed you, continue there", ephemeral=True)
+        else:
+            await interaction.followup.send("i DMed you, continue there", ephemeral=True)
+
+    # always DM the actual payload
     await interaction.user.send(content=content, file=file, view=view)
 
 # ==========================
