@@ -62,18 +62,27 @@ def parse_schedule_with_gemini(image_bytes: bytes) -> str:
 # ==========================
 # Helper for DM-first replies
 # ==========================
-async def respond_dm_first(interaction: discord.Interaction, message: str, file: discord.File | None = None, view: discord.ui.View | None = None):
-    """Send response via DM if in guild, otherwise ephemeral in DM."""
+async def respond_dm_only(
+    interaction: discord.Interaction,
+    message: str,
+    file: discord.File | None = None,
+    view: discord.ui.View | None = None
+):
+    """Force all interactions to DM, with ephemeral notices in guilds."""
     if interaction.guild is not None:
-        # Command used in a server → DM user, notify in channel
+        # Used in a server → DM full response, notify in server
         try:
             await interaction.user.send(message, file=file, view=view)
             await interaction.response.send_message("💌 I DMed you, continue there!", ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message("❌ I couldn’t DM you. Please enable DMs.", ephemeral=True)
     else:
-        # Already in DM → respond ephemeral
-        await interaction.response.send_message(message, ephemeral=True, file=file, view=view)
+        # Already in DM → ephemeral (ignored but same behavior as original code)
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True, file=file, view=view)
+        else:
+            await interaction.response.send_message(message, ephemeral=True, file=file, view=view)
+
 
 
 
@@ -307,7 +316,7 @@ async def help_command(interaction: discord.Interaction):
         "• **/delete** – remove your saved credentials\n"
         "• **/schedule** – upload your class schedule\n"
     )
-    await respond_dm_first(interaction, help_text)
+    await respond_dm_only(interaction, help_text)
 
 
 @tree.command(name="cancel", description="Cancel the current setup or pending upload")
@@ -317,51 +326,44 @@ async def cancel(interaction: discord.Interaction):
     user_temp_data.pop(user_id, None)
     waiting_upload.discard(user_id)
     pending_csv.pop(user_id, None)
-    await respond_dm_first(interaction, "❌ Cancelled.")
+    await respond_dm_only(interaction, "❌ Cancelled.")
 
 
 @tree.command(name="setup", description="Link your SPADA account (guided)")
 async def setup(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     if find_username_by_id(user_id):
-        await respond_dm_first(interaction, "⚠️ You already have an account linked. Use /delete first.")
+        await respond_dm_only(interaction, "⚠️ You already have an account linked. Use /delete first.")
         return
 
+    # must respond immediately or Discord times out
+    await respond_dm_only(interaction, "🟢 What is your SPADA username?")
     user_states[user_id] = "awaiting_username"
-    await respond_dm_first(interaction, "🟢 What is your SPADA username?")
 
     def check_u(m: discord.Message):
-        return m.author == interaction.user and m.channel == interaction.channel
+        return m.author == interaction.user and isinstance(m.channel, discord.DMChannel)
 
     try:
         msg_u = await client.wait_for("message", check=check_u, timeout=120)
     except asyncio.TimeoutError:
+        await interaction.followup.send("❌ Timed out waiting for username.", ephemeral=True)
         user_states.pop(user_id, None)
-        await respond_dm_first(interaction, "❌ Timed out waiting for username.")
-        return
-
-    if user_states.get(user_id) != "awaiting_username":
-        await respond_dm_first(interaction, "❌ Setup cancelled.")
         return
 
     username = msg_u.content.strip()
     user_temp_data[user_id] = {"username": username}
     user_states[user_id] = "awaiting_password"
-    await respond_dm_first(interaction, "🔐 What is your SPADA password?⚠️ Stored in plain text. Use a unique password.")
+    await interaction.followup.send("🔐 What is your SPADA password?⚠️ Stored in plain text. Use a unique password.", ephemeral=True)
 
     def check_p(m: discord.Message):
-        return m.author == interaction.user and m.channel == interaction.channel
+        return m.author == interaction.user and isinstance(m.channel, discord.DMChannel)
 
     try:
         msg_p = await client.wait_for("message", check=check_p, timeout=120)
     except asyncio.TimeoutError:
+        await interaction.followup.send("❌ Timed out waiting for password.", ephemeral=True)
         user_states.pop(user_id, None)
         user_temp_data.pop(user_id, None)
-        await respond_dm_first(interaction, "❌ Timed out waiting for password.")
-        return
-
-    if user_states.get(user_id) != "awaiting_password":
-        await respond_dm_first(interaction, "❌ Setup cancelled.")
         return
 
     password = msg_p.content.strip()
@@ -371,7 +373,10 @@ async def setup(interaction: discord.Interaction):
     user_states.pop(user_id, None)
     user_temp_data.pop(user_id, None)
 
-    await respond_dm_first(interaction, "✅ Credentials saved!\n💡 Don’t forget to upload your schedule with /schedule → Upload Schedule.")
+    await interaction.followup.send(
+        "✅ Credentials saved!\n💡 Don’t forget to upload your schedule with /schedule → Upload Schedule.",
+        ephemeral=True
+    )
 
 
 @tree.command(name="mystatus", description="Show linked SPADA account info and pause state")
@@ -381,7 +386,7 @@ async def mystatus(interaction: discord.Interaction):
     schedule_path = find_schedule_path(user_id)
 
     if not username:
-        await respond_dm_first(interaction, "⚠️ No linked SPADA user found.")
+        await respond_dm_only(interaction, "⚠️ No linked SPADA user found.")
         return
 
     pause_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
@@ -400,7 +405,7 @@ async def mystatus(interaction: discord.Interaction):
         f"📂 **Schedule:** {schedule_path if schedule_path else 'not linked'}\n"
         f"⏱️ **Status:** {pause_state}"
     )
-    await respond_dm_first(interaction, msg)
+    await respond_dm_only(interaction, msg)
 
 
 @tree.command(name="pause", description="Pause attendance indefinitely")
@@ -408,19 +413,18 @@ async def pause(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     username = find_username_by_id(user_id)
     if not username:
-        await respond_dm_first(interaction, "⚠️ No linked SPADA user found.")
+        await respond_dm_only(interaction, "⚠️ No linked SPADA user found.")
         return
     flag_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
     if os.path.exists(flag_file):
-        await respond_dm_first(interaction, "⚠️ Already paused indefinitely. Use /resume to clear it.")
+        await respond_dm_only(interaction, "⚠️ Already paused indefinitely. Use /resume to clear it.")
         return
-    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
-    if once_flags:
-        await respond_dm_first(interaction, "⚠️ You have a one-time pause active. Use /resume first.")
+    if any(f.startswith(f"pause_once_{username}_") for f in os.listdir(FLAG_DIR)):
+        await respond_dm_only(interaction, "⚠️ You have a one-time pause active. Use /resume first.")
         return
     with open(flag_file, "w") as f:
         f.write("paused")
-    await respond_dm_first(interaction, "⏸️ Attendance paused indefinitely. Use /resume to re-enable.")
+    await respond_dm_only(interaction, "⏸️ Attendance paused indefinitely. Use /resume to re-enable.")
 
 
 @tree.command(name="resume", description="Resume attendance if paused")
@@ -428,7 +432,7 @@ async def resume(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     username = find_username_by_id(user_id)
     if not username:
-        await respond_dm_first(interaction, "⚠️ No linked SPADA user found.")
+        await respond_dm_only(interaction, "⚠️ No linked SPADA user found.")
         return
     flag_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
     if os.path.exists(flag_file):
@@ -436,13 +440,12 @@ async def resume(interaction: discord.Interaction):
             os.remove(flag_file)
         except Exception:
             pass
-    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
-    for fpath in once_flags:
+    for f in [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]:
         try:
-            os.remove(os.path.join(FLAG_DIR, fpath))
+            os.remove(os.path.join(FLAG_DIR, f))
         except Exception:
             pass
-    await respond_dm_first(interaction, "▶️ Attendance resumed.")
+    await respond_dm_only(interaction, "▶️ Attendance resumed.")
 
 
 @tree.command(name="pauseonce", description="Pause attendance for your next upcoming class only")
@@ -451,42 +454,40 @@ async def pauseonce(interaction: discord.Interaction):
     username = find_username_by_id(user_id)
     schedule_path = find_schedule_path(user_id)
     if not username or not schedule_path:
-        await respond_dm_first(interaction, "⚠️ No linked SPADA user or schedule.")
+        await respond_dm_only(interaction, "⚠️ No linked SPADA user or schedule.")
         return
-    indefinite_flag = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
-    if os.path.exists(indefinite_flag):
-        await respond_dm_first(interaction, "⚠️ You are paused indefinitely. Use /resume first.")
+    if os.path.exists(os.path.join(FLAG_DIR, f"pause_user_{username}.flag")):
+        await respond_dm_only(interaction, "⚠️ You are paused indefinitely. Use /resume first.")
         return
-    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
-    if once_flags:
-        await respond_dm_first(interaction, "⚠️ You already have a one-time pause active. Use /resume first.")
+    if any(f.startswith(f"pause_once_{username}_") for f in os.listdir(FLAG_DIR)):
+        await respond_dm_only(interaction, "⚠️ You already have a one-time pause active. Use /resume first.")
         return
     next_class = get_next_class(schedule_path)
     if not next_class:
-        await respond_dm_first(interaction, "ℹ️ No upcoming class found to pause.")
+        await respond_dm_only(interaction, "ℹ️ No upcoming class found to pause.")
         return
     flag_file = os.path.join(FLAG_DIR, f"pause_once_{username}_{next_class.replace(' ', '_')}.flag")
     with open(flag_file, "w") as f:
         f.write("skip next")
-    await respond_dm_first(interaction, f"⏸️ Next class **{next_class}** will be skipped.")
+    await respond_dm_only(interaction, f"⏸️ Next class **{next_class}** will be skipped.")
 
 
 @tree.command(name="delete", description="Remove your saved credentials (also deletes schedule & pause flags)")
 async def delete(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     if delete_credentials(user_id):
-        await respond_dm_first(interaction, "🗑️ Account, schedule, and flags deleted.")
+        await respond_dm_only(interaction, "🗑️ Account, schedule, and flags deleted.")
     else:
-        await respond_dm_first(interaction, "⚠️ No account found to delete.")
+        await respond_dm_only(interaction, "⚠️ No account found to delete.")
 
 
 @tree.command(name="schedule", description="Manage your class schedule (upload/view/delete)")
 async def schedule(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     if not find_username_by_id(user_id):
-        await respond_dm_first(interaction, "⚠️ Please run /setup first.")
+        await respond_dm_only(interaction, "⚠️ Please run /setup first.")
         return
-    await respond_dm_first(interaction, "📌 Manage your schedule:", view=ScheduleMenu(user_id))
+    await respond_dm_only(interaction, "📌 Manage your schedule:", view=ScheduleMenu(user_id))
 
 # ==========================
 # Handle image uploads (for the Upload button flow)
