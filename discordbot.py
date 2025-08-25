@@ -49,11 +49,12 @@ def parse_schedule_with_gemini(image_bytes: bytes) -> str:
         "Extract the class schedule from this image and return only CSV rows. "
         "Columns must be in this exact order: CourseName,Day,Time. "
         "Example:\n"
-        "CourseName,Day,Time"
+        "CourseName,Day,Time\n"
         "Matematika,Senin,07:00 - 09:00\n"
         "Fisika,Rabu,10:00 - 12:00\n"
         "Always add column name"
-        "Do not forget the space before and after hyphen for the time"
+	"Do not add ```csv```\n"
+        "Do not forget the space before and after hyphen for the time\n"
         "Do not include class, explanations, or extra text. only Course Name, Day and Time."
     )
     resp = gemini_model.generate_content([prompt, image_data])
