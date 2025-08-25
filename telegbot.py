@@ -50,7 +50,7 @@ def parse_schedule_with_gemini(image_bytes: bytes) -> str:
         "Matematika,Senin,07:00 - 09:00\n"
         "Fisika,Rabu,10:00 - 12:00\n"
         "Always add column name\n"
-	"Do not add ```csv```\n"
+		"Do not add ```csv``` or any code fences\n"
         "Do not forget the space before and after hyphen for the time\n"
         "Do not include class, explanations, or extra text. only Course Name, Day and Time."
     )
