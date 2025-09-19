@@ -159,6 +159,25 @@ async def update_schedule_time(course_name, new_time, schedule_file, user):
         msg = f"⏰ Your schedule for *{course_name}* was corrected from **{old_time}** to **{new_time}**."
         print(msg)
         await notify_user(msg, user)
+        
+# --- helper: parse Moodle date strings like "Sat 6 Sep 2025" / "Friday, 12 September 2025"
+def _parse_moodle_date(s: str):
+    s = s.strip()
+    fmts = [
+        "%a %d %b %Y",        # Sat 06 Sep 2025 / Sat 6 Sep 2025
+        "%a %d %B %Y",        # Sat 06 September 2025
+        "%A %d %b %Y",        # Saturday 6 Sep 2025
+        "%A %d %B %Y",        # Saturday 6 September 2025
+        "%d %b %Y",           # 6 Sep 2025
+        "%d %B %Y",           # 6 September 2025
+    ]
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
+
 
 # --- Playwright Automation ---
 def normalize_time_str(t: str) -> str:
@@ -231,25 +250,38 @@ async def login_and_attend(playwright, user, course_name):
         await att_link.click()
         await page.wait_for_timeout(2000)
 
-        # Scrape the <td class="datecol"> cells to get real session time
+        # Scrape the <td class="datecol"> cells and use ONLY today's row
         time_cells = await page.query_selector_all("td.datecol")
+        today = datetime.now().date()  # use system tz of the runner
+        
+        matched = False
         for cell in time_cells:
             nobrs = await cell.query_selector_all("nobr")
             texts = [ (await n.inner_text()).strip() for n in nobrs ]
+        
+            # Expect: texts[0] = date, texts[1] = "3:30PM - 3:45PM"
             if len(texts) >= 2:
-                real_time = texts[1]  # second <nobr> contains the time range
-                try:
-                    start_str, end_str = real_time.split("-")
-                    start_str = normalize_time_str(start_str)
-                    end_str = normalize_time_str(end_str)
+                date_text = texts[0]
+                date_val = _parse_moodle_date(date_text)
+                if date_val == today:
+                    real_time = texts[1]
+                    try:
+                        start_str, end_str = real_time.split("-")
+                        start_str = normalize_time_str(start_str)
+                        end_str = normalize_time_str(end_str)
+        
+                        start_fmt = datetime.strptime(start_str.strip(), "%I:%M%p").strftime("%H:%M")
+                        end_fmt = datetime.strptime(end_str.strip(), "%I:%M%p").strftime("%H:%M")
+                        new_time = f"{start_fmt} - {end_fmt}"
+                        await update_schedule_time(course_name, new_time, user["schedule_file"], user)
+                    except Exception as e:
+                        print(f"⚠️ Failed to parse real time {real_time}: {e}")
+                    matched = True
+                    break
+                
+        if not matched:
+            print("ℹ️ No attendance row for today; skipping schedule correction to avoid stale times.")
 
-                    start_fmt = datetime.strptime(start_str.strip(), "%I:%M%p").strftime("%H:%M")
-                    end_fmt = datetime.strptime(end_str.strip(), "%I:%M%p").strftime("%H:%M")
-                    new_time = f"{start_fmt} - {end_fmt}"
-                    await update_schedule_time(course_name, new_time, user["schedule_file"], user)
-                except Exception as e:
-                    print(f"⚠️ Failed to parse real time {real_time}: {e}")
-                break
 
         try:
             await page.click("a:has-text('Submit attendance')", timeout=4000)
