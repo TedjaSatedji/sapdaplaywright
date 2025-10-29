@@ -129,7 +129,7 @@ def get_current_class(schedule):
             )
 
             # Allow attendance if within 15 minutes of start
-            if start_time <= current_time <= start_time + timedelta(minutes=30):
+            if start_time <= current_time <= start_time + timedelta(minutes=15):
                 return entry["CourseName"]
 
     return None
