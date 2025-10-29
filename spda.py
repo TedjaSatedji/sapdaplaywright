@@ -189,7 +189,7 @@ def normalize_time_str(t: str) -> str:
 
 async def login_and_attend(playwright, user, course_name):
     browser = await playwright.chromium.launch(headless=True)
-    context = await browser.new_context()
+    context = await browser.new_context(ignore_https_errors=True)
     page = await context.new_page()
 
     username = user["username"]
