@@ -1,3 +1,28 @@
 /.env
 /schedules/
 breakmess.py
+/__pycache__
+/flags
+announcement.py
+cron.log
+
+
+# Don't copy Docker/Git stuff
+Dockerfile
+docker-compose.yml
+.dockerignore
+.git/
+.gitignore
+
+# Don't copy local secrets or data!
+.env
+schedules/
+flags/
+
+# Don't copy Python cache or system files
+__pycache__/
+*.pyc
+.DS_Store
+
+# Don't copy any .tar image files
+*.tar
