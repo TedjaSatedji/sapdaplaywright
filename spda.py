@@ -1,4 +1,3 @@
-
 import csv
 import re
 from datetime import datetime, timedelta
@@ -9,8 +8,11 @@ import asyncio
 from playwright.async_api import async_playwright
 import discord
 
+# --- NEW: Flag Directory Structure ---
 FLAG_DIR = "flags"
+ATTENDANCE_FLAG_DIR = os.path.join(FLAG_DIR, "attendance")
 os.makedirs(FLAG_DIR, exist_ok=True)
+os.makedirs(ATTENDANCE_FLAG_DIR, exist_ok=True) # Create the new subfolder
 
 # Load environment variables
 load_dotenv()
@@ -86,23 +88,52 @@ def load_users():
             })
     return users
 
-# --- Pause Check ---
+# --- Pause/Attendance Check ---
 def is_paused(username: str, course_name: str) -> bool:
     """Check if attendance should be skipped due to pause flags."""
-    # Indefinite pause
+    # Pause flags stay in the main FLAG_DIR
     pause_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
     if os.path.exists(pause_file):
         print(f"⏸️ {username} is paused indefinitely.")
         return True
 
-    # One-time pause for this class
-    once_file = os.path.join(FLAG_DIR, f"pause_once_{username}_{course_name.replace(' ','_')}.flag")
+    safe_course = course_name.replace(' ','_')
+    once_file = os.path.join(FLAG_DIR, f"pause_once_{username}_{safe_course}.flag")
     if os.path.exists(once_file):
         print(f"⏸️ Skipping one class {course_name} for {username}.")
         os.remove(once_file)  # consume the flag
         return True
 
     return False
+
+def has_attended_today(username: str, course_name: str) -> bool:
+    """Check if a success flag already exists for this class today."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    safe_course = course_name.replace(' ','_')
+    # Success flags are now in the ATTENDANCE_FLAG_DIR
+    flag_file = os.path.join(ATTENDANCE_FLAG_DIR, f"success_{username}_{safe_course}_{today}.flag")
+    
+    if os.path.exists(flag_file):
+        print(f"✅ {username} has already attended {course_name} today.")
+        return True
+    return False
+
+# --- Retry Attempt Tracking ---
+def get_current_attempt(username: str, course_name: str) -> int:
+    """Checks for retry flags to determine the current attempt number."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    safe_course = course_name.replace(' ','_')
+    base_flag_name = f"retry_{username}_{safe_course}_{today}_attempt_"
+    
+    # Check in REVERSE order
+    if os.path.exists(os.path.join(ATTENDANCE_FLAG_DIR, f"{base_flag_name}3.flag")):
+        return 4  # This signals "don't even try"
+    if os.path.exists(os.path.join(ATTENDANCE_FLAG_DIR, f"{base_flag_name}2.flag")):
+        return 3  # This is the 3rd attempt
+    if os.path.exists(os.path.join(ATTENDANCE_FLAG_DIR, f"{base_flag_name}1.flag")):
+        return 2  # This is the 2nd attempt
+    
+    return 1 # This is the 1st attempt
 
 # --- Schedule ---
 def load_schedule(csv_file):
@@ -187,7 +218,13 @@ def normalize_time_str(t: str) -> str:
         t = t.replace("AM", ":00AM").replace("PM", ":00PM")
     return t
 
-async def login_and_attend(playwright, user, course_name):
+async def login_and_attend(playwright, user, course_name) -> bool:
+    """
+    Tries to attend a class.
+    Returns True on success.
+    Returns False on "login fail" (unrecoverable).
+    Raises Exception on ALL other failures (retriable).
+    """
     browser = await playwright.firefox.launch(headless=True)
     context = await browser.new_context(ignore_https_errors=True)
     page = await context.new_page()
@@ -197,16 +234,7 @@ async def login_and_attend(playwright, user, course_name):
 
     try:
         print(f"Processing attendance for {username}...")
-        for attempt in range(3):
-            try:
-                await page.goto("https://spada.upnyk.ac.id/login/index.php", timeout=60000)
-                break
-            except Exception as e:
-                if attempt == 2:
-                    print(f"❌ Failed to load login page for {username} after 3 attempts.")
-                    await notify_user(f"❌ Error loading the page for {username}, ask the admin.", user)
-                    return
-                await asyncio.sleep(5)
+        await page.goto("https://spada.upnyk.ac.id/login/index.php", timeout=60000)
 
         await page.fill("#username", username)
         await page.fill("#password", password)
@@ -215,8 +243,7 @@ async def login_and_attend(playwright, user, course_name):
         await page.wait_for_timeout(3000)
         if "login/index.php" in page.url:
             print(f"❌ Login failed for {username}")
-            await notify_user(f"❌ Login failed for {username}. Please recheck credentials.", user)
-            return
+            return False # UNRECOVERABLE (soft fail)
 
         links = await page.query_selector_all("a")
         course_link = None
@@ -228,8 +255,7 @@ async def login_and_attend(playwright, user, course_name):
 
         if not course_link:
             print(f"Course '{course_name}' not found for {username}")
-            await notify_user(f"Course '{course_name}' not found for {username}", user)
-            return
+            raise Exception(f"Course '{course_name}' not found on SPADA.") # RETRIABLE
 
         await course_link.click()
         await page.wait_for_timeout(2000)
@@ -244,22 +270,19 @@ async def login_and_attend(playwright, user, course_name):
 
         if not att_link:
             print(f"No attendance link for {username}")
-            await notify_user(f"No attendance link found in {course_name} for you.", user)
-            return
+            raise Exception(f"No attendance link found for {course_name}.") # RETRIABLE
 
         await att_link.click()
         await page.wait_for_timeout(2000)
 
-        # Scrape the <td class="datecol"> cells and use ONLY today's row
         time_cells = await page.query_selector_all("td.datecol")
-        today = datetime.now().date()  # use system tz of the runner
+        today = datetime.now().date()
         
         matched = False
         for cell in time_cells:
             nobrs = await cell.query_selector_all("nobr")
             texts = [ (await n.inner_text()).strip() for n in nobrs ]
         
-            # Expect: texts[0] = date, texts[1] = "3:30PM - 3:45PM"
             if len(texts) >= 2:
                 date_text = texts[0]
                 date_val = _parse_moodle_date(date_text)
@@ -282,7 +305,6 @@ async def login_and_attend(playwright, user, course_name):
         if not matched:
             print("ℹ️ No attendance row for today; skipping schedule correction to avoid stale times.")
 
-
         try:
             await page.click("a:has-text('Submit attendance')", timeout=4000)
             await page.wait_for_selector("label.form-check-label", timeout=4000)
@@ -300,25 +322,124 @@ async def login_and_attend(playwright, user, course_name):
 
             await page.click("#id_submitbutton")
             print(f"✅ Attendance submitted for {username}!")
-            await notify_user(f"✅ {course_name} attendance submitted successfully for {username}.", user)
-        except:
-            print(f"ℹ️ Could not submit attendance for {username}.")
-            await notify_user(f"ℹ️ No active attendance found for {course_name}. {username}", user)
+            return True # SUCCESS
+        
+        except Exception as e:
+            print(f"ℹ️ Could not submit attendance for {username} (e.g., already submitted or link closed).")
+            raise Exception(f"Could not submit attendance for {course_name} (link closed or already submitted).") # RETRIABLE
 
     except Exception as e:
-        print(f"❌ Error for {username}: {e}")
-        await notify_user(f"❌ Error during attendance for {username}, ask the admin.", user)
+        if "not found on SPADA" in str(e) or "No attendance link found" in str(e) or "Could not submit attendance" in str(e):
+             raise e # Re-raise our nice error
+        else:
+             print(f"❌ Hard Error for {username}: {e}")
+             raise Exception(f"Page timed out or failed to load for {course_name}.") # Generic hard failure
+    
     finally:
         await context.close()
         await browser.close()
 
-async def limited_login_and_attend(semaphore, playwright, user, course_name):
+def _clear_retry_flags(username: str, course_name: str, today: str):
+    """Helper to delete all retry flags for a user/course/day."""
+    safe_course = course_name.replace(' ','_')
+    base_flag_name = f"retry_{username}_{safe_course}_{today}_attempt_"
+    for i in range(1, 4): # Clear all possible attempt flags
+        flag_path = os.path.join(ATTENDANCE_FLAG_DIR, f"{base_flag_name}{i}.flag")
+        if os.path.exists(flag_path):
+            try:
+                os.remove(flag_path)
+            except Exception as e:
+                print(f"Warning: could not remove retry flag {flag_path}: {e}")
+
+
+async def limited_login_and_attend(semaphore, playwright, user, course_name, attempt):
+    """Manages ONE attempt and notifications for the attendance task."""
     async with semaphore:
-        await login_and_attend(playwright, user, course_name)
+        
+        today = datetime.now().strftime("%Y-%m-%d")
+        safe_course = course_name.replace(' ','_')
+        
+        if attempt > 3:
+            print(f"❌ Already failed 3 times for {user['username']} - {course_name}. Skipping.")
+            return
+
+        try:
+            print(f"Attempt {attempt}/3 for {user['username']} - {course_name}")
+            
+            success = await login_and_attend(playwright, user, course_name)
+            
+            if success:
+                print(f"✅ Success for {user['username']}")
+                await notify_user(f"✅ {course_name} attendance submitted successfully for {user['username']}.", user)
+                
+                # Create success flag in the subfolder
+                flag_file = os.path.join(ATTENDANCE_FLAG_DIR, f"success_{user['username']}_{safe_course}_{today}.flag")
+                with open(flag_file, "w") as f:
+                    f.write("attended")
+                
+                # Clear all retry flags on success
+                _clear_retry_flags(user['username'], course_name, today)
+                return  # Success, we are done
+
+            else:
+                # This block is ONLY reached if login_and_attend returned False (Login Fail)
+                print(f"❌ Login failed for {user['username']}. No retry.")
+                await notify_user(f"❌ Login failed for {user['username']}. Please recheck credentials.", user)
+                return # Don't retry login failures
+
+        except Exception as e:
+            # This block is for ALL other failures (no link, timeout, etc.)
+            print(f"❌ Retriable failure for {user['username']}: {e}")
+            user_friendly_error = str(e)
+            
+            # --- Renaming Logic ---
+            # 1. Create the new attempt flag
+            retry_flag_file = os.path.join(ATTENDANCE_FLAG_DIR, f"retry_{user['username']}_{safe_course}_{today}_attempt_{attempt}.flag")
+            with open(retry_flag_file, "w") as f:
+                f.write(f"failed on attempt {attempt}")
+            
+            # 2. Delete the PREVIOUS attempt flag (if it exists)
+            if attempt > 1:
+                prev_attempt = attempt - 1
+                prev_flag_file = os.path.join(ATTENDANCE_FLAG_DIR, f"retry_{user['username']}_{safe_course}_{today}_attempt_{prev_attempt}.flag")
+                if os.path.exists(prev_flag_file):
+                    try:
+                        os.remove(prev_flag_file)
+                    except Exception as e:
+                        print(f"Warning: could not remove previous flag {prev_flag_file}: {e}")
+
+            # --- MODIFIED: Send notification on FIRST and LAST attempt ONLY ---
+            if attempt == 1:
+                # First failure
+                await notify_user(f"ℹ️ {user_friendly_error} (Attempt 1/3). Will retry on the next run.", user)
+            elif attempt == 3:
+                # Final failure
+                await notify_user(f"❌ Failed to attend {course_name} after 3 attempts. (Last error: {user_friendly_error})", user)
+            # On attempt 2, no notification will be sent.
+            
+            return
+
+# --- Flag Cleanup Function ---
+def cleanup_old_flags():
+    """Deletes any success OR retry flags not from today."""
+    print("🧹 Running cleanup for old flags...")
+    today_suffix = f"_{datetime.now().strftime('%Y-%m-%d')}"
+    
+    # Scan the subfolder
+    for filename in os.listdir(ATTENDANCE_FLAG_DIR):
+        # We only care about success and retry flags
+        if filename.startswith("success_") or filename.startswith("retry_"):
+            if today_suffix not in filename:
+                print(f"Removing old flag: {filename}")
+                try:
+                    os.remove(os.path.join(ATTENDANCE_FLAG_DIR, filename))
+                except Exception as e:
+                    print(f"Failed to remove {filename}: {e}")
 
 # --- Main ---
-
 async def main():
+    cleanup_old_flags()
+
     users = load_users()
     if not users:
         print("No users found in .env")
@@ -334,22 +455,35 @@ async def main():
             if not os.path.exists(schedule_path):
                 print(f"Schedule file not found: {schedule_path}")
                 continue
+            
             schedule = load_schedule(schedule_path)
             current_class = get_current_class(schedule)
+            
             if current_class:
-                # Check pause before scheduling attendance
+                if has_attended_today(user["username"], current_class):
+                    continue 
+
                 if is_paused(user["username"], current_class):
                     await notify_user(f"⏸️ Skipped attendance for {current_class} (paused).", user)
                     continue
+                
+                # --- FIXED: Check attempt number before scheduling ---
+                current_attempt = get_current_attempt(user["username"], current_class)
 
-                print(f"Current class for {user['username']}: {current_class}")
-                async def delayed_task(user=user, current_class=current_class, delay=delay):
+                if current_attempt > 3:
+                    print(f"Skipping {current_class} for {user['username']}: Already failed 3 attempts.")
+                    continue # Skip this user, all attempts used
+
+                print(f"Current class for {user['username']}: {current_class} (Attempt {current_attempt})")
+                async def delayed_task(user=user, current_class=current_class, delay=delay, attempt=current_attempt):
                     await asyncio.sleep(delay)
-                    await limited_login_and_attend(semaphore, playwright, user, current_class)
+                    await limited_login_and_attend(semaphore, playwright, user, current_class, attempt)
+                
                 tasks.append(delayed_task())
                 delay += 2
             else:
                 print(f"No class at the moment for {user['username']}.")
+        
         if tasks:
             await asyncio.gather(*tasks)
 
