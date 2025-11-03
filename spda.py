@@ -493,7 +493,7 @@ async def limited_login_and_attend(semaphore, playwright, user: dict, course_nam
             if attempt == 1:
                 await notify_user(f"❌ Failed to attend {course_name} will try again in ~5 minutes.", user)
             elif attempt == 2:
-                await notify_user(f"❌ Failed to attend {course_name} after 2 attempts.", user)
+                await notify_user(f"After 2 attempts {err}", user)
 
 
 # =============================================================================
