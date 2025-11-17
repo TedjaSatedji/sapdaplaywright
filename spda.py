@@ -305,7 +305,7 @@ def _normalize_time_str(t: str) -> str:
 # Core: Playwright flow
 # =============================================================================
 
-async def login_and_attend(playwright, user: dict, course_name: str) -> bool:
+async def login_and_attend(browser, user: dict, course_name: str) -> bool:
     """
     Try to submit attendance.
     Returns:
@@ -314,7 +314,6 @@ async def login_and_attend(playwright, user: dict, course_name: str) -> bool:
     Raises:
       Exception -> retriable issues (no link, closed, timeouts, etc.)
     """
-    browser = await playwright.firefox.launch(headless=True)
     context = await browser.new_context(ignore_https_errors=True)
     page = await context.new_page()
 
@@ -433,10 +432,9 @@ async def login_and_attend(playwright, user: dict, course_name: str) -> bool:
         raise Exception(f"Page timed out or failed to load for {course_name}.")
     finally:
         await context.close()
-        await browser.close()
 
 
-async def limited_login_and_attend(semaphore, playwright, user: dict, course_name: str, attempt: int):
+async def limited_login_and_attend(semaphore, browser, user: dict, course_name: str, attempt: int):
     """
     Run a single attempt. Max attempts per day: 2.
     - attempt 1: notify on failure (info)
@@ -452,7 +450,7 @@ async def limited_login_and_attend(semaphore, playwright, user: dict, course_nam
 
         try:
             print(f"Attempt {attempt}/2 for {user['username']} - {course_name}")
-            success = await login_and_attend(playwright, user, course_name)
+            success = await login_and_attend(browser, user, course_name)
 
             if success:
                 await notify_user(f"✅ {course_name} attendance submitted for {user['username']}.", user)
@@ -508,47 +506,51 @@ async def run_main():
         print("No users found in .env")
         return
 
-    semaphore = asyncio.Semaphore(4)
+    semaphore = asyncio.Semaphore(3)
 
     async with async_playwright() as pw:
-        tasks = []
-        stagger = 0
-        for user in users:
-            schedule_path = user["schedule_file"]
-            if not os.path.exists(schedule_path):
-                print(f"Schedule file not found: {schedule_path}")
-                continue
+        browser = await pw.firefox.launch(headless=True)
+        try:
+            tasks = []
+            stagger = 0
+            for user in users:
+                schedule_path = user["schedule_file"]
+                if not os.path.exists(schedule_path):
+                    print(f"Schedule file not found: {schedule_path}")
+                    continue
 
-            schedule = load_schedule(schedule_path)
-            current_class = get_current_class(schedule)
+                schedule = load_schedule(schedule_path)
+                current_class = get_current_class(schedule)
 
-            if not current_class:
-                print(f"No class at the moment for {user['username']}.")
-                continue
+                if not current_class:
+                    print(f"No class at the moment for {user['username']}.")
+                    continue
 
-            if has_attended_today(user["username"], current_class):
-                continue
+                if has_attended_today(user["username"], current_class):
+                    continue
 
-            if is_paused(user["username"], current_class):
-                await notify_user(f"⏸️ Skipped attendance for {current_class} (paused).", user)
-                continue
+                if is_paused(user["username"], current_class):
+                    await notify_user(f"⏸️ Skipped attendance for {current_class} (paused).", user)
+                    continue
 
-            current_attempt = get_current_attempt(user["username"], current_class)
-            if current_attempt > 2:
-                print(f"Skipping {current_class} for {user['username']}: already failed 2 attempts.")
-                continue
+                current_attempt = get_current_attempt(user["username"], current_class)
+                if current_attempt > 2:
+                    print(f"Skipping {current_class} for {user['username']}: already failed 2 attempts.")
+                    continue
 
-            print(f"Current class for {user['username']}: {current_class} (Attempt {current_attempt}/2)")
+                print(f"Current class for {user['username']}: {current_class} (Attempt {current_attempt}/2)")
 
-            async def task(u=user, cls=current_class, wait=stagger, att=current_attempt):
-                await asyncio.sleep(wait)  # mild staggering
-                await limited_login_and_attend(semaphore, pw, u, cls, att)
+                async def task(u=user, cls=current_class, wait=stagger, att=current_attempt):
+                    await asyncio.sleep(wait)  # mild staggering
+                    await limited_login_and_attend(semaphore, browser, u, cls, att)
 
-            tasks.append(task())
-            stagger += 2  # two seconds between user starts
+                tasks.append(task())
+                stagger += 2  # two seconds between user starts
 
-        if tasks:
-            await asyncio.gather(*tasks)
+            if tasks:
+                await asyncio.gather(*tasks)
+        finally:
+            await browser.close()
 
 
 async def maybe_start_discord():
