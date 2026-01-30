@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/spadaplaywright
-EnvironmentFile=/root/spadaplaywright/.env
-ExecStart=/root/spadaplaywright/venv/bin/python /root/spadaplaywright/discordbot.py
+WorkingDirectory=/root/sapdaplaywright
+EnvironmentFile=/root/sapdaplaywright/.env
+ExecStart=/root/sapdaplaywright/venv/bin/python /root/sapdaplaywright/discordbot.py
 Restart=always
 RestartSec=5
 User=root
