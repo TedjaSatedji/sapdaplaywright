@@ -31,7 +31,7 @@ pending_csv = {}        # chat_id -> csv text awaiting Save/Cancel
 # Gemini
 # =============================
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
 def parse_schedule_with_gemini(image_bytes: bytes) -> str:
     """
