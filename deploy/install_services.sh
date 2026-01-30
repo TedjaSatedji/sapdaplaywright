@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-APP_DIR="/root/spadaplaywright"
+APP_DIR="/root/sapdaplaywright"
 SYSTEMD_DIR="/etc/systemd/system"
 
 echo "➡️ Installing systemd service files..."

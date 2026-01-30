@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-APP_DIR="/root/spadaplaywright"
+APP_DIR="/root/sapdaplaywright"
 
 echo "➡️ Creating virtual environment..."
 python3 -m venv venv
