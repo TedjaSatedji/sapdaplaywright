@@ -87,7 +87,7 @@ CourseName,Day,Time
 Data Science Basics,Senin,08:15 - 10:00
 Web Development,Selasa,13:00 - 15:30
 Cloud Computing,Kamis,09:45 - 11:15
-Machine Learning Intro,Jumat,10:30 - 12:00
+Machine Learning Intro,Kamis,10:30 - 12:00
 ```
 
 ---
