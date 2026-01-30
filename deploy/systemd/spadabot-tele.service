@@ -1,0 +1,16 @@
+[Unit]
+Description=SpadaBot Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/spadaplaywright
+EnvironmentFile=/root/spadaplaywright/.env
+ExecStart=/root/spadaplaywright/venv/bin/python /root/spadaplaywright/telebot.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
