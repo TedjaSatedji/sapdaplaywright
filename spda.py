@@ -403,11 +403,13 @@ async def login_and_attend(browser, user: dict, course_name: str) -> bool:
             for label in labels:
                 try:
                     span = await label.query_selector(".statusdesc")
-                    if span and (await span.inner_text()).strip().lower() == "present":
-                        radio = await label.query_selector("input")
-                        await radio.click()
-                        picked = True
-                        break
+                    if span:
+                        text = (await span.inner_text()).strip().lower()
+                        if text in ("present", "hadir"):
+                            radio = await label.query_selector("input")
+                            await radio.click()
+                            picked = True
+                            break
                 except Exception:
                     continue
 
