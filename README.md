@@ -56,8 +56,10 @@ You can set up users in three ways:
    ```
 4. Use these commands inside Telegram:  
    - `/setup` → link SPADA credentials  
+   - `/credsedit` → update saved SPADA username/password  
+   - `/credscheck` → verify saved SPADA username/password  
    - `/schedule` → upload/view/delete schedule (Gemini can parse from image 📸)  
-   - `/me`, `/delete`, `/cancel` as needed  
+   - `/mystatus`, `/delete`, `/cancel` as needed  
 
 ---
 
@@ -70,8 +72,10 @@ You can set up users in three ways:
    ```
 4. Use these commands in Discord:  
    - `/setup` → link SPADA credentials  
+   - `/credsedit` → update saved SPADA username/password  
+   - `/credscheck` → verify saved SPADA username/password  
    - `/schedule` → upload/view/delete schedule (Gemini can parse from image 📸)  
-   - `/me`, `/delete`, `/cancel` as needed  
+   - `/mystatus`, `/delete`, `/cancel` as needed  
 
 ---
 

@@ -1,13 +1,17 @@
 import os
 import io
+import re
 from dotenv import load_dotenv
 import telebot
 from telebot import types
 import google.generativeai as genai
+import requests
+import urllib3
 from datetime import datetime
 
 FLAG_DIR = "flags"
 os.makedirs(FLAG_DIR, exist_ok=True)
+SPADA_LOGIN_URL = "https://spada.upnyk.ac.id/login/index.php"
 
 # =============================
 # Boot
@@ -18,6 +22,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ENV_FILE = ".env"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =============================
 # State
@@ -57,6 +62,10 @@ def parse_schedule_with_gemini(image_bytes: bytes) -> str:
     resp = gemini_model.generate_content([prompt, image_data])
     return (resp.text or "").strip()
 
+
+def _env_value(line: str) -> str:
+    return line.strip().split("=", 1)[1] if "=" in line else ""
+
 # =============================
 # Helpers
 # =============================
@@ -65,7 +74,7 @@ def is_chat_id_exist(chat_id: str) -> bool:
         return False
     with open(ENV_FILE, "r", encoding="utf-8") as f:
         for line in f:
-            if line.startswith("TELEGRAM_CHAT_ID_") and chat_id in line:
+            if line.startswith("TELEGRAM_CHAT_ID_") and _env_value(line) == chat_id:
                 return True
     return False
 
@@ -74,7 +83,7 @@ def find_user_index_by_chat(chat_id: str):
         return None
     with open(ENV_FILE, "r", encoding="utf-8") as f:
         for line in f:
-            if line.startswith("TELEGRAM_CHAT_ID_") and chat_id in line:
+            if line.startswith("TELEGRAM_CHAT_ID_") and _env_value(line) == chat_id:
                 return line.split("_")[-1].split("=")[0].strip()
     return None
 
@@ -87,6 +96,75 @@ def find_schedule_path(chat_id: str) -> str | None:
             if line.startswith(f"SCHEDULE_FILE_{idx}="):
                 return line.strip().split("=", 1)[1]
     return None
+
+
+def find_saved_credentials(chat_id: str) -> dict | None:
+    idx = find_user_index_by_chat(chat_id)
+    if not idx or not os.path.exists(ENV_FILE):
+        return None
+
+    username = None
+    password = None
+    with open(ENV_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith(f"SPADA_USERNAME_{idx}="):
+                username = _env_value(line)
+            elif line.startswith(f"SPADA_PASSWORD_{idx}="):
+                password = _env_value(line)
+
+    if not username or not password:
+        return None
+
+    return {"username": username, "password": password}
+
+
+def verify_spada_credentials(username: str, password: str) -> tuple[bool, str]:
+    def attempt_login(verify: bool) -> tuple[bool, str]:
+        with requests.Session() as session:
+            login_page = session.get(SPADA_LOGIN_URL, timeout=20, verify=verify)
+            login_page.raise_for_status()
+
+            token_match = re.search(r'name=["\']logintoken["\']\s+value=["\']([^"\']+)["\']', login_page.text)
+            payload = {
+                "username": username,
+                "password": password,
+                "anchor": "",
+            }
+            if token_match:
+                payload["logintoken"] = token_match.group(1)
+
+            response = session.post(
+                SPADA_LOGIN_URL,
+                data=payload,
+                timeout=20,
+                allow_redirects=True,
+                verify=verify,
+            )
+            response.raise_for_status()
+
+            final_url = response.url.lower()
+            body = response.text.lower()
+            if "login/index.php" not in final_url:
+                if verify:
+                    return True, "saved credentials are valid!."
+                return True, "saved credentials are valid!."
+            if "loginerrors" in body or "invalidlogin" in body:
+                return False, "saved credentials were rejected by SPADA. please check and update them."
+            return False, "SPADA kept the session on the login page. credentials may be wrong."
+
+    try:
+        return attempt_login(verify=True)
+    except requests.exceptions.SSLError:
+        try:
+            return attempt_login(verify=False)
+        except requests.Timeout:
+            return False, "SPADA did not respond in time. try again later."
+        except requests.RequestException as exc:
+            return False, f"couldn't reach SPADA after SSL fallback: {exc}"
+    except requests.Timeout:
+        return False, "SPADA did not respond in time. try again later."
+    except requests.RequestException as exc:
+        return False, f"couldn't reach SPADA: {exc}"
 
 def get_next_index():
     if not os.path.exists(ENV_FILE):
@@ -115,6 +193,80 @@ def save_to_env(chat_id: str, creds: dict):
         f.write(f"TELEGRAM_CHAT_ID_{index}={chat_id}\n")
         f.write(f"SCHEDULE_FILE_{index}={schedule_path}\n")
 
+
+def rename_user_flags(old_username: str, new_username: str):
+    if not old_username or old_username == new_username:
+        return
+
+    rename_specs = [
+        (FLAG_DIR, f"pause_user_{old_username}", f"pause_user_{new_username}"),
+        (FLAG_DIR, f"pause_once_{old_username}_", f"pause_once_{new_username}_"),
+        (os.path.join(FLAG_DIR, "attendance"), f"success_{old_username}_", f"success_{new_username}_"),
+        (os.path.join(FLAG_DIR, "attendance"), f"retry_{old_username}_", f"retry_{new_username}_"),
+    ]
+
+    for directory, old_prefix, new_prefix in rename_specs:
+        if not os.path.isdir(directory):
+            continue
+        for filename in os.listdir(directory):
+            if not filename.startswith(old_prefix):
+                continue
+            old_path = os.path.join(directory, filename)
+            new_path = os.path.join(directory, filename.replace(old_prefix, new_prefix, 1))
+            try:
+                os.replace(old_path, new_path)
+            except Exception:
+                pass
+
+
+def update_credentials(chat_id: str, creds: dict) -> bool:
+    if not os.path.exists(ENV_FILE):
+        return False
+
+    with open(ENV_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    new_lines = []
+    found = False
+    old_username = None
+    i = 0
+
+    while i < len(lines):
+        if (
+            i + 4 < len(lines)
+            and lines[i].startswith("#---")
+            and lines[i + 1].startswith("SPADA_USERNAME_")
+            and lines[i + 2].startswith("SPADA_PASSWORD_")
+            and lines[i + 3].startswith("TELEGRAM_CHAT_ID_")
+            and lines[i + 4].startswith("SCHEDULE_FILE_")
+        ):
+            current_chat_id = _env_value(lines[i + 3])
+            if current_chat_id == chat_id:
+                index = lines[i + 1].split("_")[-1].split("=")[0].strip()
+                old_username = _env_value(lines[i + 1])
+                new_lines.extend([
+                    f"#--- {creds['username']} ---\n",
+                    f"SPADA_USERNAME_{index}={creds['username']}\n",
+                    f"SPADA_PASSWORD_{index}={creds['password']}\n",
+                    lines[i + 3],
+                    lines[i + 4],
+                ])
+                found = True
+                i += 5
+                continue
+
+        new_lines.append(lines[i])
+        i += 1
+
+    if not found:
+        return False
+
+    with open(ENV_FILE, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+    rename_user_flags(old_username, creds["username"])
+    return True
+
 def delete_credentials(chat_id: str) -> bool:
     if not os.path.exists(ENV_FILE):
         return False
@@ -133,7 +285,7 @@ def delete_credentials(chat_id: str) -> bool:
             and lines[i+2].startswith("SPADA_PASSWORD_")
             and lines[i+3].startswith("TELEGRAM_CHAT_ID_")
             and lines[i+4].startswith("SCHEDULE_FILE_")
-            and chat_id in lines[i+3]
+            and _env_value(lines[i+3]) == chat_id
         ):
             found = True
             username = lines[i+1].strip().split("=", 1)[1]
@@ -185,7 +337,7 @@ def find_username_by_chat(chat_id: str) -> str | None:
     with open(ENV_FILE, "r", encoding="utf-8") as f:
         lines = f.readlines()
     for i, line in enumerate(lines):
-        if line.startswith("TELEGRAM_CHAT_ID_") and chat_id in line:
+        if line.startswith("TELEGRAM_CHAT_ID_") and _env_value(line) == chat_id:
             if i >= 2 and lines[i-2].startswith("SPADA_USERNAME_"):
                 return lines[i-2].split("=", 1)[1].strip()
     return None
@@ -227,6 +379,8 @@ def handle_help(message):
         "Here’s what I can do for you:\n"
         "• <b>/help</b> – show this help message\n"
         "• <b>/setup</b> – link your SPADA account\n"
+        "• <b>/credsedit</b> – update your saved SPADA username/password\n"
+        "• <b>/credscheck</b> – verify your saved SPADA credentials\n"
         "• <b>/mystatus</b> – show your SPADA user, schedule, and pause status\n"
         "• <b>/pause</b> – pause attendance indefinitely\n"
         "• <b>/resume</b> – resume attendance if paused\n"
@@ -266,15 +420,51 @@ def cmd_mystatus(message):
     )
 
     bot.send_message(chat_id, msg, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["credscheck"])
+def handle_credscheck(message):
+    chat_id = str(message.chat.id)
+    creds = find_saved_credentials(chat_id)
+
+    if not creds:
+        bot.send_message(chat_id, "⚠️ no saved credentials found. run /setup first.")
+        return
+
+    bot.send_message(chat_id, "🔎 checking your saved SPADA credentials...")
+    is_valid, result_message = verify_spada_credentials(creds["username"], creds["password"])
+
+    if is_valid:
+        bot.send_message(chat_id, f"✅ {result_message}")
+    else:
+        bot.send_message(chat_id, f"❌ {result_message}")
     
 @bot.message_handler(commands=["setup"])
 def handle_setup(message):
     chat_id = str(message.chat.id)
     if is_chat_id_exist(chat_id):
-        bot.send_message(chat_id, "⚠️ you already saved credentials. use /delete first if you want to replace.")
+        bot.send_message(chat_id, "⚠️ you already saved credentials. use /credsedit if you want to update them.")
         return
     user_states[chat_id] = "awaiting_username"
-    bot.send_message(chat_id, "🟢 what's your SPADA username, darling?")
+    bot.send_message(chat_id, "🟢 what's your SPADA username/NIM?")
+
+
+@bot.message_handler(commands=["credsedit"])
+def handle_change_credentials(message):
+    chat_id = str(message.chat.id)
+    current_username = find_username_by_chat(chat_id)
+
+    if not current_username:
+        bot.send_message(chat_id, "⚠️ no saved credentials found. run /setup first.")
+        return
+
+    user_temp_data[chat_id] = {"mode": "change"}
+    user_states[chat_id] = "changing_username"
+    bot.send_message(
+        chat_id,
+        f"🟡 your current SPADA username/NIM is <b>{current_username}</b>.\n\n"
+        "send your new username/NIM now."
+    )
 
 @bot.message_handler(commands=["cancel"])
 def cancel(message):
@@ -283,13 +473,13 @@ def cancel(message):
     user_temp_data.pop(chat_id, None)
     waiting_upload.discard(chat_id)
     pending_csv.pop(chat_id, None)
-    bot.send_message(chat_id, "❌ cancelled. i’m still here if you need me~")
+    bot.send_message(chat_id, "❌ cancelled.")
 
 @bot.message_handler(commands=["delete"])
 def handle_delete(message):
     chat_id = str(message.chat.id)
     if delete_credentials(chat_id):
-        bot.send_message(chat_id, "🗑️ credentials, schedule, and flags deleted. poof~")
+        bot.send_message(chat_id, "🗑️ credentials, schedule, and flags deleted.")
     else:
         bot.send_message(chat_id, "⚠️ no credentials found to delete.")
 
@@ -380,7 +570,7 @@ def handle_conversation(message):
     state = user_states.get(chat_id)
 
     if state == "awaiting_username":
-        user_temp_data[chat_id] = {"username": text}
+        user_temp_data[chat_id] = {"mode": "setup", "username": text}
         user_states[chat_id] = "awaiting_password"
         bot.send_message(
             chat_id,
@@ -395,6 +585,22 @@ def handle_conversation(message):
         bot.send_message(chat_id, "✅ credentials saved!")
         # gentle reminder to upload schedule
         bot.send_message(chat_id, "💡 don’t forget to upload your schedule with <b>/schedule</b> → <i>Upload Schedule</i>.")
+    elif state == "changing_username":
+        user_temp_data[chat_id]["username"] = text
+        user_states[chat_id] = "changing_password"
+        bot.send_message(
+            chat_id,
+            "🔐 send your new SPADA password now.\n\n"
+            "<b>warning:</b> it’s stored in plain text. use a unique password."
+        )
+    elif state == "changing_password":
+        user_temp_data[chat_id]["password"] = text
+        if update_credentials(chat_id, user_temp_data[chat_id]):
+            bot.send_message(chat_id, "✅ credentials updated.")
+        else:
+            bot.send_message(chat_id, "❌ couldn't update your credentials. try /setup if the current record is missing.")
+        user_states.pop(chat_id, None)
+        user_temp_data.pop(chat_id, None)
 
 # =============================
 # Photo handling (Upload flow)
@@ -417,7 +623,7 @@ def handle_photo(message):
     file_info = bot.get_file(message.photo[-1].file_id)
     image_bytes = bot.download_file(file_info.file_path)
 
-    bot.send_message(chat_id, "⏳ processing your schedule image with Gemini… hold tight~")
+    bot.send_message(chat_id, "⏳ processing your schedule image with Gemini…")
 
     try:
         csv_text = parse_schedule_with_gemini(image_bytes)

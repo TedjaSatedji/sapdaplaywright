@@ -1,8 +1,11 @@
 import os
 import io
 import asyncio
+import re
 from datetime import datetime
 from dotenv import load_dotenv
+import requests
+import urllib3
 import discord
 from discord import app_commands
 import google.generativeai as genai
@@ -14,6 +17,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ENV_FILE = ".env"
+SPADA_LOGIN_URL = "https://spada.upnyk.ac.id/login/index.php"
 
 FLAG_DIR = "flags"
 SCHEDULE_DIR = "schedules"
@@ -24,6 +28,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================
 # State (UI flow)
@@ -69,7 +74,7 @@ def find_user_index_by_id(user_id: str):
         return None
     with open(ENV_FILE, "r", encoding="utf-8") as f:
         for line in f:
-            if line.startswith("DISCORD_USER_ID_") and user_id in line:
+            if line.startswith("DISCORD_USER_ID_") and line.strip().split("=", 1)[1] == user_id if "=" in line else False:
                 return line.split("_")[-1].split("=")[0].strip()
     return None
 
@@ -94,6 +99,150 @@ def find_schedule_path(user_id: str) -> str | None:
             if line.startswith(f"SCHEDULE_FILE_{idx}="):
                 return line.strip().split("=", 1)[1]
     return None
+
+
+def find_saved_credentials(user_id: str) -> dict | None:
+    idx = find_user_index_by_id(user_id)
+    if not idx or not os.path.exists(ENV_FILE):
+        return None
+
+    username = None
+    password = None
+    with open(ENV_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith(f"SPADA_USERNAME_{idx}="):
+                username = line.strip().split("=", 1)[1] if "=" in line else None
+            elif line.startswith(f"SPADA_PASSWORD_{idx}="):
+                password = line.strip().split("=", 1)[1] if "=" in line else None
+
+    if not username or not password:
+        return None
+
+    return {"username": username, "password": password}
+
+
+def verify_spada_credentials(username: str, password: str) -> tuple[bool, str]:
+    def attempt_login(verify: bool) -> tuple[bool, str]:
+        with requests.Session() as session:
+            login_page = session.get(SPADA_LOGIN_URL, timeout=20, verify=verify)
+            login_page.raise_for_status()
+
+            token_match = re.search(r'name=["\']logintoken["\']\s+value=["\']([^"\']+)["\']', login_page.text)
+            payload = {
+                "username": username,
+                "password": password,
+                "anchor": "",
+            }
+            if token_match:
+                payload["logintoken"] = token_match.group(1)
+
+            response = session.post(
+                SPADA_LOGIN_URL,
+                data=payload,
+                timeout=20,
+                allow_redirects=True,
+                verify=verify,
+            )
+            response.raise_for_status()
+
+            final_url = response.url.lower()
+            body = response.text.lower()
+            if "login/index.php" not in final_url:
+                if verify:
+                    return True, "saved credentials are valid!"
+                return True, "saved credentials are valid! (SPADA's SSL certificate could not be verified)"
+            if "loginerrors" in body or "invalidlogin" in body:
+                return False, "saved credentials were rejected by SPADA. Please check and update them."
+            return False, "SPADA kept the session on the login page. Credentials may be wrong."
+
+    try:
+        return attempt_login(verify=True)
+    except requests.exceptions.SSLError:
+        try:
+            return attempt_login(verify=False)
+        except requests.Timeout:
+            return False, "SPADA did not respond in time. Try again later."
+        except requests.RequestException as exc:
+            return False, f"couldn't reach SPADA after SSL fallback: {exc}"
+    except requests.Timeout:
+        return False, "SPADA did not respond in time. Try again later."
+    except requests.RequestException as exc:
+        return False, f"couldn't reach SPADA: {exc}"
+
+
+def rename_user_flags(old_username: str, new_username: str):
+    if not old_username or old_username == new_username:
+        return
+
+    rename_specs = [
+        (FLAG_DIR, f"pause_user_{old_username}", f"pause_user_{new_username}"),
+        (FLAG_DIR, f"pause_once_{old_username}_", f"pause_once_{new_username}_"),
+        (os.path.join(FLAG_DIR, "attendance"), f"success_{old_username}_", f"success_{new_username}_"),
+        (os.path.join(FLAG_DIR, "attendance"), f"retry_{old_username}_", f"retry_{new_username}_"),
+    ]
+
+    for directory, old_prefix, new_prefix in rename_specs:
+        if not os.path.isdir(directory):
+            continue
+        for filename in os.listdir(directory):
+            if not filename.startswith(old_prefix):
+                continue
+            old_path = os.path.join(directory, filename)
+            new_path = os.path.join(directory, filename.replace(old_prefix, new_prefix, 1))
+            try:
+                os.replace(old_path, new_path)
+            except Exception:
+                pass
+
+
+def update_credentials(user_id: str, creds: dict) -> bool:
+    if not os.path.exists(ENV_FILE):
+        return False
+
+    with open(ENV_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    new_lines = []
+    found = False
+    old_username = None
+    i = 0
+
+    while i < len(lines):
+        if (
+            i + 4 < len(lines)
+            and lines[i].startswith("#---")
+            and lines[i + 1].startswith("SPADA_USERNAME_")
+            and lines[i + 2].startswith("SPADA_PASSWORD_")
+            and lines[i + 3].startswith("DISCORD_USER_ID_")
+            and lines[i + 4].startswith("SCHEDULE_FILE_")
+        ):
+            current_user_id = lines[i + 3].strip().split("=", 1)[1] if "=" in lines[i + 3] else ""
+            if current_user_id == user_id:
+                index = lines[i + 1].split("_")[-1].split("=")[0].strip()
+                old_username = lines[i + 1].strip().split("=", 1)[1] if "=" in lines[i + 1] else None
+                new_lines.extend([
+                    f"#--- {creds['username']} ---\n",
+                    f"SPADA_USERNAME_{index}={creds['username']}\n",
+                    f"SPADA_PASSWORD_{index}={creds['password']}\n",
+                    lines[i + 3],
+                    lines[i + 4],
+                ])
+                found = True
+                i += 5
+                continue
+
+        new_lines.append(lines[i])
+        i += 1
+
+    if not found:
+        return False
+
+    with open(ENV_FILE, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+    if old_username:
+        rename_user_flags(old_username, creds["username"])
+    return True
 
 
 def get_next_index():
@@ -138,7 +287,7 @@ def delete_credentials(user_id: str) -> bool:
             and lines[i+2].startswith("SPADA_PASSWORD_")
             and lines[i+3].startswith("DISCORD_USER_ID_")
             and lines[i+4].startswith("SCHEDULE_FILE_")
-            and user_id in lines[i+3]
+            and lines[i+3].strip().split("=", 1)[1] == user_id
         ):
             found = True
             username = lines[i+1].strip().split("=", 1)[1]
@@ -278,8 +427,8 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(
         "👋 Hello! Here’s what I can do for you:\n"
         "• **/help** – show this help message\n"
-        "• **/setup** – link your SPADA account\n"
-        "• **/mystatus** – show your SPADA user, schedule, and pause status\n"
+        "• **/setup** – link your SPADA account\n"        "• **/credsedit** – update your saved SPADA username/password\n"
+        "• **/credscheck** – verify your saved SPADA credentials\n"        "• **/mystatus** – show your SPADA user, schedule, and pause status\n"
         "• **/pause** – pause attendance indefinitely\n"
         "• **/resume** – resume attendance if paused\n"
         "• **/pauseonce** – skip attendance for your next class\n"
@@ -303,11 +452,11 @@ async def cancel(interaction: discord.Interaction):
 async def setup(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     if find_username_by_id(user_id):
-        await interaction.response.send_message("⚠️ You already have an account linked. Use /delete first.", ephemeral=True)
+        await interaction.response.send_message("⚠️ You already have an account linked. Use /credsedit to update.", ephemeral=True)
         return
 
     user_states[user_id] = "awaiting_username"
-    await interaction.response.send_message("🟢 What is your SPADA username?", ephemeral=True)
+    await interaction.response.send_message("🟢 What is your SPADA username/NIM?", ephemeral=True)
 
     def check_u(m: discord.Message):
         return m.author == interaction.user and m.channel == interaction.channel
@@ -353,6 +502,83 @@ async def setup(interaction: discord.Interaction):
     await interaction.followup.send("✅ Credentials saved!", ephemeral=True)
     await interaction.followup.send("💡 Don’t forget to upload your schedule with /schedule → Upload Schedule.", ephemeral=True)
 
+@tree.command(name="credscheck", description="Verify your saved SPADA credentials")
+async def credscheck(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    creds = find_saved_credentials(user_id)
+
+    if not creds:
+        await interaction.response.send_message("⚠️ No saved credentials found. Run /setup first.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("🔎 Checking your saved SPADA credentials...", ephemeral=True)
+    is_valid, result_message = verify_spada_credentials(creds["username"], creds["password"])
+
+    if is_valid:
+        await interaction.followup.send(f"✅ {result_message}", ephemeral=True)
+    else:
+        await interaction.followup.send(f"❌ {result_message}", ephemeral=True)
+
+
+@tree.command(name="credsedit", description="Update your saved SPADA username/password")
+async def credsedit(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    current_username = find_username_by_id(user_id)
+
+    if not current_username:
+        await interaction.response.send_message("⚠️ No saved credentials found. Run /setup first.", ephemeral=True)
+        return
+
+    user_states[user_id] = "changing_username"
+    await interaction.response.send_message(
+        f"🟡 Your current SPADA username/NIM is **{current_username}**\n\nSend your new username/NIM now.",
+        ephemeral=True
+    )
+
+    def check_u(m: discord.Message):
+        return m.author == interaction.user and m.channel == interaction.channel
+
+    try:
+        msg_u = await client.wait_for("message", check=check_u, timeout=120)
+    except asyncio.TimeoutError:
+        user_states.pop(user_id, None)
+        await interaction.followup.send("❌ Timed out waiting for username.", ephemeral=True)
+        return
+
+    if user_states.get(user_id) != "changing_username":
+        await interaction.followup.send("❌ Update cancelled.", ephemeral=True)
+        return
+
+    new_username = msg_u.content.strip()
+    user_temp_data[user_id] = {"username": new_username}
+    user_states[user_id] = "changing_password"
+    await interaction.followup.send("🔐 Send your new SPADA password now. (Stored in plain text — use a unique password)", ephemeral=True)
+
+    def check_p(m: discord.Message):
+        return m.author == interaction.user and m.channel == interaction.channel
+
+    try:
+        msg_p = await client.wait_for("message", check=check_p, timeout=120)
+    except asyncio.TimeoutError:
+        user_states.pop(user_id, None)
+        user_temp_data.pop(user_id, None)
+        await interaction.followup.send("❌ Timed out waiting for password.", ephemeral=True)
+        return
+
+    if user_states.get(user_id) != "changing_password":
+        await interaction.followup.send("❌ Update cancelled.", ephemeral=True)
+        return
+
+    new_password = msg_p.content.strip()
+    user_temp_data[user_id]["password"] = new_password
+
+    if update_credentials(user_id, user_temp_data[user_id]):
+        await interaction.followup.send("✅ Credentials updated.", ephemeral=True)
+    else:
+        await interaction.followup.send("❌ Couldn't update credentials. Try /setup if the record is missing.", ephemeral=True)
+
+    user_states.pop(user_id, None)
+    user_temp_data.pop(user_id, None)
 
 @tree.command(name="mystatus", description="Show linked SPADA account info and pause state")
 async def mystatus(interaction: discord.Interaction):
