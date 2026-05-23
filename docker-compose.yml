@@ -1,0 +1,37 @@
+version: '3.8'
+
+x-base: &base
+  build: .
+  volumes:
+    - ./.env:/app/.env
+    - ./schedules:/app/schedules
+    - ./flags:/app/flags
+  restart: unless-stopped
+
+services:
+  # Telegram Bot Service
+  telegram_bot:
+    <<: *base
+    container_name: sapda_telegram_bot
+    command: python telegbot.py
+    profiles:
+      - telegram
+      - bots
+
+  # Discord Bot Service
+  discord_bot:
+    <<: *base
+    container_name: sapda_discord_bot
+    command: python discordbot.py
+    profiles:
+      - discord
+      - bots
+
+  # Attendance Script (Runs every 5 minutes)
+  spda:
+    <<: *base
+    container_name: sapda_attendance
+    restart: unless-stopped
+    command: /bin/sh -c "while true; do python spda.py; echo 'Waiting 5 minutes...'; sleep 300; done"
+    profiles:
+      - spda
