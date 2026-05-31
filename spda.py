@@ -9,6 +9,7 @@ SPADA auto-attendance (max two retries per class per day)
 import asyncio
 import csv
 import os
+import random
 import re
 from datetime import datetime, timedelta
 
@@ -508,13 +509,13 @@ async def run_main():
         print("No users found in .env")
         return
 
+    random.shuffle(users)
     semaphore = asyncio.Semaphore(3)
 
     async with async_playwright() as pw:
         browser = await pw.firefox.launch(headless=True)
         try:
             tasks = []
-            stagger = 0
             for user in users:
                 schedule_path = user["schedule_file"]
                 if not os.path.exists(schedule_path):
@@ -542,12 +543,12 @@ async def run_main():
 
                 print(f"Current class for {user['username']}: {current_class} (Attempt {current_attempt}/2)")
 
-                async def task(u=user, cls=current_class, wait=stagger, att=current_attempt):
+                wait_time = random.uniform(0, 300)
+                async def task(u=user, cls=current_class, wait=wait_time, att=current_attempt):
                     await asyncio.sleep(wait)  # mild staggering
                     await limited_login_and_attend(semaphore, browser, u, cls, att)
 
                 tasks.append(task())
-                stagger += 2  # two seconds between user starts
 
             if tasks:
                 await asyncio.gather(*tasks)
