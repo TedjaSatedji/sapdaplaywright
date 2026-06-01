@@ -118,6 +118,56 @@ What happens:
 
 ---
 
+## 🐳 Docker Deployment
+
+You can run the entire stack using Docker Compose.
+
+### Build the image
+```sh
+docker compose build
+```
+
+### Run individual services
+
+**Telegram bot only:**
+```sh
+docker compose --profile telegram up -d
+```
+
+**Discord bot only:**
+```sh
+docker compose --profile discord up -d
+```
+
+**Attendance script (runs every 5 minutes):**
+```sh
+docker compose --profile spda up -d
+```
+
+**Both bots together:**
+```sh
+docker compose --profile bots up -d
+```
+
+**Everything at once:**
+```sh
+docker compose --profile telegram --profile discord --profile spda up -d
+```
+
+### Stop services
+```sh
+docker compose down
+```
+
+### Logs
+```sh
+docker compose logs -f
+```
+
+> Volumes are mounted for `.env`, `schedules/`, and `flags/` so changes persist across restarts.
+
+---
+
 ## 🔒 Security Notes
 
 - ⚠️ Passwords are stored in **plain text**. Please use unique ones.  
