@@ -543,7 +543,7 @@ async def run_main():
 
                 print(f"Current class for {user['username']}: {current_class} (Attempt {current_attempt}/2)")
 
-                wait_time = random.uniform(0, 300)
+                wait_time = random.uniform(0, 30)
                 async def task(u=user, cls=current_class, wait=wait_time, att=current_attempt):
                     await asyncio.sleep(wait)  # mild staggering
                     await limited_login_and_attend(semaphore, browser, u, cls, att)
