@@ -20,8 +20,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Playwright browsers (and their OS dependencies)
-# We only install Chromium to keep the image smaller, adjust if you need others
-RUN playwright install --with-deps chromium
+# Installing Chromium and Firefox with their system dependencies
+RUN playwright install --with-deps chromium firefox
 
 # Copy the rest of the project files
 COPY . .
