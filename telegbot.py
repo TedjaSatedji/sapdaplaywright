@@ -1,329 +1,106 @@
 import os
 import io
-import re
+import html
 from dotenv import load_dotenv
 import telebot
 from telebot import types
-import google.generativeai as genai
-import requests
-import urllib3
-from datetime import datetime
 
-FLAG_DIR = "flags"
-os.makedirs(FLAG_DIR, exist_ok=True)
-SPADA_LOGIN_URL = "https://spada.upnyk.ac.id/login/index.php"
+import store
 
 # =============================
 # Boot
 # =============================
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ENV_FILE = ".env"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =============================
 # State
 # =============================
-user_states = {}        # setup convo states
-user_temp_data = {}     # temp creds during setup
-waiting_upload = set()  # chat_ids currently asked to upload an image
+user_states = {}        # /setup & /credsedit conversation states
+user_temp_data = {}     # temp creds during those conversations
+waiting_upload = set()  # chat_ids asked to upload (plain = image, "csv_{id}" = CSV)
 pending_csv = {}        # chat_id -> csv text awaiting Save/Cancel
+pending_skip = {}       # chat_id -> course list shown in the /pauseonce picker
+
+HELP_TEXT = (
+    "hi hi~ 💫 here's what i can do:\n\n"
+    "🆕 new here? <b>/tutorial</b> walks you through setup\n\n"
+    "👤 <b>account</b>\n"
+    "• /setup – link your SPADA account\n"
+    "• /mystatus – account, schedule & pause status\n"
+    "• /credscheck – verify saved credentials\n"
+    "• /credsedit – update username/password\n"
+    "• /delete – remove your account\n\n"
+    "⏱️ <b>attendance</b>\n"
+    "• /pause – pause attendance indefinitely\n"
+    "• /pauseonce – skip a class (you pick which)\n"
+    "• /resume – clear any pause\n\n"
+    "📅 <b>schedule</b>\n"
+    "• /schedule – upload, view or delete your schedule\n\n"
+    "🧹 /cancel – cancel whatever's in progress"
+)
+
+TUTORIAL_STEPS = [
+    "👋 <b>welcome!</b>\n\n"
+    "i'm your SPADA attendance buddy — i automatically submit your class attendance "
+    "and message you the result here.\n\n"
+    "setup takes ~2 minutes. tap <b>next ▶</b> to get started.",
+
+    "1️⃣ <b>link your account</b>\n\n"
+    "send /setup and answer my two questions:\n"
+    "• your SPADA username/NIM\n"
+    "• your password\n\n"
+    "⚠️ passwords are stored in plain text — use a unique one.",
+
+    "2️⃣ <b>upload your schedule</b>\n\n"
+    "send /schedule, then pick one:\n"
+    "• 🖼 <b>Upload Schedule Image</b> — snap a photo of your schedule, i'll read it with Gemini ✨\n"
+    "• ⬆️ <b>Upload CSV</b> — already have a CSV? even faster.",
+
+    "3️⃣ <b>you're done!</b>\n\n"
+    "when a class starts, i attend it for you and message you the result here. "
+    "nothing to do on your end.\n\n"
+    "check /mystatus anytime to see your next class.",
+
+    "4️⃣ <b>need a break?</b>\n\n"
+    "• /pauseonce — skip one class (you pick which)\n"
+    "• /pause — stop attending until you say so\n"
+    "• /resume — back on duty\n\n"
+    "that's everything. you're all set! 🎉",
+]
+
+
+def tutorial_markup(step: int) -> types.InlineKeyboardMarkup:
+    last = len(TUTORIAL_STEPS) - 1
+    row = []
+    if step > 0:
+        row.append(types.InlineKeyboardButton("◀ prev", callback_data=f"tut_{step - 1}"))
+    if step < last:
+        row.append(types.InlineKeyboardButton("next ▶", callback_data=f"tut_{step + 1}"))
+    else:
+        row.append(types.InlineKeyboardButton("✅ done", callback_data="tut_done"))
+    row.append(types.InlineKeyboardButton("📚 all commands", callback_data="tut_help"))
+    kb = types.InlineKeyboardMarkup()
+    kb.add(*row)
+    return kb
 
 # =============================
-# Gemini
+# Small UI helpers
 # =============================
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite")
-
-def parse_schedule_with_gemini(image_bytes: bytes) -> str:
-    """
-    Use Gemini to parse the schedule image and return CSV rows (no header).
-    Required column order: CourseName,Day,Time
-    """
-    image_data = {
-        "mime_type": "image/jpeg",  # Telegram photos are JPEG; still works for PNG
-        "data": image_bytes
-    }
-    prompt = (
-        "Extract the class schedule from this image and return only CSV rows. "
-        "Columns must be in this exact order: CourseName,Day,Time. "
-        "Example:\n"
-        "CourseName,Day,Time\n"
-        "Matematika,Senin,07:00 - 09:00\n"
-        "Fisika,Rabu,10:00 - 12:00\n"
-        "Always add column name\n"
-		"Do not add ```csv``` or any code fences\n"
-        "Do not forget the space before and after hyphen for the time\n"
-        "Do not include class, explanations, or extra text. only Course Name, Day and Time."
-    )
-    resp = gemini_model.generate_content([prompt, image_data])
-    return (resp.text or "").strip()
-
-
-def _env_value(line: str) -> str:
-    return line.strip().split("=", 1)[1] if "=" in line else ""
-
-# =============================
-# Helpers
-# =============================
-def is_chat_id_exist(chat_id: str) -> bool:
-    if not os.path.exists(ENV_FILE):
-        return False
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("TELEGRAM_CHAT_ID_") and _env_value(line) == chat_id:
-                return True
-    return False
-
-def find_user_index_by_chat(chat_id: str):
-    if not os.path.exists(ENV_FILE):
-        return None
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("TELEGRAM_CHAT_ID_") and _env_value(line) == chat_id:
-                return line.split("_")[-1].split("=")[0].strip()
-    return None
-
-def find_schedule_path(chat_id: str) -> str | None:
-    idx = find_user_index_by_chat(chat_id)
-    if not idx:
-        return None
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.startswith(f"SCHEDULE_FILE_{idx}="):
-                return line.strip().split("=", 1)[1]
-    return None
-
-
-def find_saved_credentials(chat_id: str) -> dict | None:
-    idx = find_user_index_by_chat(chat_id)
-    if not idx or not os.path.exists(ENV_FILE):
-        return None
-
-    username = None
-    password = None
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.startswith(f"SPADA_USERNAME_{idx}="):
-                username = _env_value(line)
-            elif line.startswith(f"SPADA_PASSWORD_{idx}="):
-                password = _env_value(line)
-
-    if not username or not password:
-        return None
-
-    return {"username": username, "password": password}
-
-
-def verify_spada_credentials(username: str, password: str) -> tuple[bool, str]:
-    def attempt_login(verify: bool) -> tuple[bool, str]:
-        with requests.Session() as session:
-            login_page = session.get(SPADA_LOGIN_URL, timeout=20, verify=verify)
-            login_page.raise_for_status()
-
-            token_match = re.search(r'name=["\']logintoken["\']\s+value=["\']([^"\']+)["\']', login_page.text)
-            payload = {
-                "username": username,
-                "password": password,
-                "anchor": "",
-            }
-            if token_match:
-                payload["logintoken"] = token_match.group(1)
-
-            response = session.post(
-                SPADA_LOGIN_URL,
-                data=payload,
-                timeout=20,
-                allow_redirects=True,
-                verify=verify,
-            )
-            response.raise_for_status()
-
-            final_url = response.url.lower()
-            body = response.text.lower()
-            if "login/index.php" not in final_url:
-                if verify:
-                    return True, "saved credentials are valid!."
-                return True, "saved credentials are valid!."
-            if "loginerrors" in body or "invalidlogin" in body:
-                return False, "saved credentials were rejected by SPADA. please check and update them."
-            return False, "SPADA kept the session on the login page. credentials may be wrong."
-
-    try:
-        return attempt_login(verify=True)
-    except requests.exceptions.SSLError:
-        try:
-            return attempt_login(verify=False)
-        except requests.Timeout:
-            return False, "SPADA did not respond in time. try again later."
-        except requests.RequestException as exc:
-            return False, f"couldn't reach SPADA after SSL fallback: {exc}"
-    except requests.Timeout:
-        return False, "SPADA did not respond in time. try again later."
-    except requests.RequestException as exc:
-        return False, f"couldn't reach SPADA: {exc}"
-
-def get_next_index():
-    if not os.path.exists(ENV_FILE):
-        return 1
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        indices = [
-            int(line.split("_")[-1].split("=")[0])
-            for line in f if line.startswith("SPADA_USERNAME_")
-        ]
-        return max(indices) + 1 if indices else 1
-
-def save_to_env(chat_id: str, creds: dict):
-    """
-    Writes new creds to .env (existing behavior for setup).
-    """
-    index = get_next_index()
-    schedule_dir = "schedules"
-    os.makedirs(schedule_dir, exist_ok=True)
-    schedule_path = f"{schedule_dir}/schedule_{index}.csv"
-    if not os.path.exists(schedule_path):
-        open(schedule_path, "w", encoding="utf-8").close()
-    with open(ENV_FILE, "a", encoding="utf-8") as f:
-        f.write(f"#--- {creds['username']} ---\n")
-        f.write(f"SPADA_USERNAME_{index}={creds['username']}\n")
-        f.write(f"SPADA_PASSWORD_{index}={creds['password']}\n")
-        f.write(f"TELEGRAM_CHAT_ID_{index}={chat_id}\n")
-        f.write(f"SCHEDULE_FILE_{index}={schedule_path}\n")
-
-
-def rename_user_flags(old_username: str, new_username: str):
-    if not old_username or old_username == new_username:
-        return
-
-    rename_specs = [
-        (FLAG_DIR, f"pause_user_{old_username}", f"pause_user_{new_username}"),
-        (FLAG_DIR, f"pause_once_{old_username}_", f"pause_once_{new_username}_"),
-        (os.path.join(FLAG_DIR, "attendance"), f"success_{old_username}_", f"success_{new_username}_"),
-        (os.path.join(FLAG_DIR, "attendance"), f"retry_{old_username}_", f"retry_{new_username}_"),
-    ]
-
-    for directory, old_prefix, new_prefix in rename_specs:
-        if not os.path.isdir(directory):
-            continue
-        for filename in os.listdir(directory):
-            if not filename.startswith(old_prefix):
-                continue
-            old_path = os.path.join(directory, filename)
-            new_path = os.path.join(directory, filename.replace(old_prefix, new_prefix, 1))
-            try:
-                os.replace(old_path, new_path)
-            except Exception:
-                pass
-
-
-def update_credentials(chat_id: str, creds: dict) -> bool:
-    if not os.path.exists(ENV_FILE):
-        return False
-
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    new_lines = []
-    found = False
-    old_username = None
-    i = 0
-
-    while i < len(lines):
-        if (
-            i + 4 < len(lines)
-            and lines[i].startswith("#---")
-            and lines[i + 1].startswith("SPADA_USERNAME_")
-            and lines[i + 2].startswith("SPADA_PASSWORD_")
-            and lines[i + 3].startswith("TELEGRAM_CHAT_ID_")
-            and lines[i + 4].startswith("SCHEDULE_FILE_")
-        ):
-            current_chat_id = _env_value(lines[i + 3])
-            if current_chat_id == chat_id:
-                index = lines[i + 1].split("_")[-1].split("=")[0].strip()
-                old_username = _env_value(lines[i + 1])
-                new_lines.extend([
-                    f"#--- {creds['username']} ---\n",
-                    f"SPADA_USERNAME_{index}={creds['username']}\n",
-                    f"SPADA_PASSWORD_{index}={creds['password']}\n",
-                    lines[i + 3],
-                    lines[i + 4],
-                ])
-                found = True
-                i += 5
-                continue
-
-        new_lines.append(lines[i])
-        i += 1
-
-    if not found:
-        return False
-
-    with open(ENV_FILE, "w", encoding="utf-8") as f:
-        f.writelines(new_lines)
-
-    rename_user_flags(old_username, creds["username"])
-    return True
-
-def delete_credentials(chat_id: str) -> bool:
-    if not os.path.exists(ENV_FILE):
-        return False
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    new_lines = []
-    found = False
-    i = 0
-    schedule_path = None
-    username = None
-    while i < len(lines):
-        if (
-            i + 4 < len(lines)
-            and lines[i].startswith("#---")
-            and lines[i+1].startswith("SPADA_USERNAME_")
-            and lines[i+2].startswith("SPADA_PASSWORD_")
-            and lines[i+3].startswith("TELEGRAM_CHAT_ID_")
-            and lines[i+4].startswith("SCHEDULE_FILE_")
-            and _env_value(lines[i+3]) == chat_id
-        ):
-            found = True
-            username = lines[i+1].strip().split("=", 1)[1]
-            schedule_path = lines[i+4].strip().split("=", 1)[1]
-            i += 5  # skip this block
-        else:
-            new_lines.append(lines[i])
-            i += 1
-    if found:
-        with open(ENV_FILE, "w", encoding="utf-8") as f:
-            f.writelines(new_lines)
-        # Delete schedule file
-        if schedule_path and os.path.exists(schedule_path):
-            try:
-                os.remove(schedule_path)
-            except Exception:
-                pass
-        # Delete all flag files for this user
-        if username:
-            for f in os.listdir(FLAG_DIR):
-                if f.startswith(f"pause_user_{username}") or f.startswith(f"pause_once_{username}_"):
-                    try:
-                        os.remove(os.path.join(FLAG_DIR, f))
-                    except Exception:
-                        pass
-    return found
-
-def schedule_menu_markup():
+def schedule_menu_markup() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
     kb.add(
-        types.InlineKeyboardButton("🖼 Upload Schedule", callback_data="sch_upload"),
+        types.InlineKeyboardButton("🖼 Upload Schedule Image", callback_data="sch_upload"),
         types.InlineKeyboardButton("⬆️ Upload CSV", callback_data="sch_upload_csv"),
         types.InlineKeyboardButton("📄 View Schedule", callback_data="sch_view"),
     )
     kb.add(types.InlineKeyboardButton("🗑 Delete Schedule", callback_data="sch_delete"))
     return kb
 
-def confirm_menu_markup():
+
+def confirm_menu_markup() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
     kb.add(
         types.InlineKeyboardButton("✅ Save", callback_data="sch_save"),
@@ -331,237 +108,238 @@ def confirm_menu_markup():
     )
     return kb
 
-def find_username_by_chat(chat_id: str) -> str | None:
-    if not os.path.exists(ENV_FILE):
-        return None
-    with open(ENV_FILE, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    for i, line in enumerate(lines):
-        if line.startswith("TELEGRAM_CHAT_ID_") and _env_value(line) == chat_id:
-            if i >= 2 and lines[i-2].startswith("SPADA_USERNAME_"):
-                return lines[i-2].split("=", 1)[1].strip()
-    return None
 
-def get_next_class(schedule_path: str):
-    if not os.path.exists(schedule_path) or os.path.getsize(schedule_path) == 0:
-        return None
-    now = datetime.now()
-    closest_class = None
-    closest_start = None
-    with open(schedule_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()[1:]  # skip header
-    for line in lines:
-        parts = line.strip().split(",")
-        if len(parts) < 3:
-            continue
-        course, day, time_str = parts
-        start_str, end_str = time_str.split(" - ")
-        try:
-            start_time = datetime.strptime(start_str, "%H:%M").replace(
-                year=now.year, month=now.month, day=now.day
-            )
-        except:
-            continue
-        if start_time > now:
-            if closest_start is None or start_time < closest_start:
-                closest_start = start_time
-                closest_class = course
-    return closest_class
+def remove_kb(call: types.CallbackQuery):
+    """Best-effort removal of an inline keyboard after a choice was made."""
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+
+
+def short_course_label(course: str, day: str, time: str) -> str:
+    """Compact 'Course · Day HH:MM' label for buttons, safe for long course names."""
+    text = f"{course} · {day} {time.split(' - ')[0]}"
+    return text if len(text) <= 60 else text[:57] + "…"
+
+
+def schedule_preview_text(csv_text: str, title: str = "here's what i extracted — save it?") -> str:
+    """Readable numbered list of schedule rows for chat display (HTML-safe)."""
+    rows = store.parse_schedule_text(csv_text)
+    header = f"📄 <b>{title}</b> ({len(rows)} classes):\n\n"
+    lines = []
+    for i, row in enumerate(rows, start=1):
+        line = f"{i}. <b>{html.escape(row['CourseName'])}</b> · {row['Day']} {row['Time']}"
+        if sum(map(len, lines)) + len(line) > 3800:  # stay under Telegram's 4096 limit
+            lines.append(f"…and {len(rows) - len(lines)} more")
+            break
+        lines.append(line)
+    return header + "\n".join(lines)
+
 
 # =============================
 # Commands
 # =============================
-@bot.message_handler(commands=["help"])
+@bot.message_handler(commands=["help", "start"])
 def handle_help(message):
-    bot.send_message(
-        message.chat.id,
-        "hi hi~ 💫\n\n"
-        "Here’s what I can do for you:\n"
-        "• <b>/help</b> – show this help message\n"
-        "• <b>/setup</b> – link your SPADA account\n"
-        "• <b>/credsedit</b> – update your saved SPADA username/password\n"
-        "• <b>/credscheck</b> – verify your saved SPADA credentials\n"
-        "• <b>/mystatus</b> – show your SPADA user, schedule, and pause status\n"
-        "• <b>/pause</b> – pause attendance indefinitely\n"
-        "• <b>/resume</b> – resume attendance if paused\n"
-        "• <b>/pauseonce</b> – skip attendance for your next class\n"
-        "• <b>/delete</b> – remove your saved credentials\n"
-        "• <b>/schedule</b> – manage your class schedule (upload/view/delete)\n"
-        "• <b>/cancel</b> – cancel any ongoing action\n"
-    )
+    bot.send_message(message.chat.id, HELP_TEXT)
+
+
+@bot.message_handler(commands=["tutorial"])
+def cmd_tutorial(message):
+    bot.send_message(message.chat.id, TUTORIAL_STEPS[0], reply_markup=tutorial_markup(0))
+
 
 @bot.message_handler(commands=["mystatus"])
 def cmd_mystatus(message):
     chat_id = str(message.chat.id)
-    username = find_username_by_chat(chat_id)
-    schedule_path = find_schedule_path(chat_id)
-
-    if not username:
-        bot.send_message(chat_id, "⚠️ No linked SPADA user found.")
+    user = store.find_user("telegram", chat_id)
+    if not user:
+        bot.send_message(chat_id, "⚠️ no linked SPADA user found. run /setup first.")
         return
 
-    # Check pause states
-    pause_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
-    pause_state = "▶️ Active"
-    if os.path.exists(pause_file):
-        pause_state = "⏸️ Paused indefinitely"
-    else:
-        # Check for any pause_once flags
-        once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
-        if once_flags:
-            paused_class = once_flags[0].replace(f"pause_once_{username}_", "").replace(".flag", "").replace("_", " ")
-            pause_state = f"⏸️ Next class ({paused_class}) will be skipped"
+    state, skipped_course = store.get_pause_state(user.username)
+    status_line = {
+        "active": "▶️ active",
+        "indefinite": "⏸️ paused indefinitely (use /resume)",
+    }.get(state, f"⏭️ <b>{skipped_course}</b> will be skipped (use /resume to undo)")
 
-    # Build status message
-    msg = (
-        f"👤 <b>SPADA User:</b> {username}\n"
-        f"📂 <b>Schedule:</b> {schedule_path if schedule_path else 'not linked'}\n"
-        f"⏱️ <b>Status:</b> {pause_state}"
+    classes = store.upcoming_classes(user.schedule_path)
+    if classes:
+        nxt = classes[0]
+        next_line = f"🕐 <b>next class:</b> {nxt['course']} · {nxt['day']} {nxt['time']}"
+    else:
+        next_line = "🕐 <b>next class:</b> none scheduled 🎉"
+
+    n_classes = len(store.load_schedule_rows(user.schedule_path))
+    schedule_line = (
+        f"📅 <b>schedule:</b> {n_classes} classes" if n_classes
+        else "📅 <b>schedule:</b> empty — add one via /schedule"
     )
 
-    bot.send_message(chat_id, msg, parse_mode="HTML")
+    bot.send_message(
+        chat_id,
+        f"👤 <b>SPADA user:</b> {user.username}\n"
+        f"{schedule_line}\n"
+        f"{next_line}\n"
+        f"⏱️ <b>status:</b> {status_line}",
+    )
+
+
+@bot.message_handler(commands=["setup"])
+def handle_setup(message):
+    chat_id = str(message.chat.id)
+    if store.find_user("telegram", chat_id):
+        bot.send_message(chat_id, "⚠️ you're already linked! use /credsedit to update, or /mystatus to check.")
+        return
+    user_states[chat_id] = "awaiting_username"
+    bot.send_message(chat_id, "🟢 what's your SPADA username/NIM?\n\n(you can /cancel anytime)")
+
+
+@bot.message_handler(commands=["credsedit"])
+def handle_credsedit(message):
+    chat_id = str(message.chat.id)
+    user = store.find_user("telegram", chat_id)
+    if not user:
+        bot.send_message(chat_id, "⚠️ no saved credentials found. run /setup first.")
+        return
+
+    user_temp_data[chat_id] = {"current_username": user.username}
+    user_states[chat_id] = "changing_username"
+    bot.send_message(
+        chat_id,
+        f"🟡 your current SPADA username/NIM is <b>{user.username}</b>.\n\n"
+        "send your new username/NIM now.\n\n(you can /cancel anytime)",
+    )
 
 
 @bot.message_handler(commands=["credscheck"])
 def handle_credscheck(message):
     chat_id = str(message.chat.id)
-    creds = find_saved_credentials(chat_id)
-
-    if not creds:
+    user = store.find_user("telegram", chat_id)
+    if not user:
         bot.send_message(chat_id, "⚠️ no saved credentials found. run /setup first.")
         return
 
     bot.send_message(chat_id, "🔎 checking your saved SPADA credentials...")
-    is_valid, result_message = verify_spada_credentials(creds["username"], creds["password"])
+    is_valid, result_message = store.verify_spada_credentials(user.username, user.password)
+    bot.send_message(chat_id, (f"✅ {result_message}" if is_valid else f"❌ {result_message}"))
 
-    if is_valid:
-        bot.send_message(chat_id, f"✅ {result_message}")
-    else:
-        bot.send_message(chat_id, f"❌ {result_message}")
-    
-@bot.message_handler(commands=["setup"])
-def handle_setup(message):
-    chat_id = str(message.chat.id)
-    if is_chat_id_exist(chat_id):
-        bot.send_message(chat_id, "⚠️ you already saved credentials. use /credsedit if you want to update them.")
-        return
-    user_states[chat_id] = "awaiting_username"
-    bot.send_message(chat_id, "🟢 what's your SPADA username/NIM?")
-
-
-@bot.message_handler(commands=["credsedit"])
-def handle_change_credentials(message):
-    chat_id = str(message.chat.id)
-    current_username = find_username_by_chat(chat_id)
-
-    if not current_username:
-        bot.send_message(chat_id, "⚠️ no saved credentials found. run /setup first.")
-        return
-
-    user_temp_data[chat_id] = {"mode": "change"}
-    user_states[chat_id] = "changing_username"
-    bot.send_message(
-        chat_id,
-        f"🟡 your current SPADA username/NIM is <b>{current_username}</b>.\n\n"
-        "send your new username/NIM now."
-    )
-
-@bot.message_handler(commands=["cancel"])
-def cancel(message):
-    chat_id = str(message.chat.id)
-    user_states.pop(chat_id, None)
-    user_temp_data.pop(chat_id, None)
-    waiting_upload.discard(chat_id)
-    pending_csv.pop(chat_id, None)
-    bot.send_message(chat_id, "❌ cancelled.")
 
 @bot.message_handler(commands=["delete"])
 def handle_delete(message):
     chat_id = str(message.chat.id)
-    if delete_credentials(chat_id):
-        bot.send_message(chat_id, "🗑️ credentials, schedule, and flags deleted.")
-    else:
+    user = store.find_user("telegram", chat_id)
+    if not user:
         bot.send_message(chat_id, "⚠️ no credentials found to delete.")
-
-@bot.message_handler(commands=["schedule"])
-def handle_schedule(message):
-    chat_id = str(message.chat.id)
-    if not is_chat_id_exist(chat_id):
-        bot.send_message(chat_id, "⚠️ run /setup first so i can link your schedule~")
         return
-    bot.send_message(chat_id, "📌 manage your schedule:", reply_markup=schedule_menu_markup())
-    
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("🗑 Yes, delete everything", callback_data="del_yes"),
+        types.InlineKeyboardButton("❌ Keep my account", callback_data="del_no"),
+    )
+    bot.send_message(
+        chat_id,
+        "⚠️ this deletes your SPADA credentials, schedule, and pause flags.\n\nare you sure?",
+        reply_markup=kb,
+    )
+
+
 @bot.message_handler(commands=["pause"])
 def cmd_pause(message):
     chat_id = str(message.chat.id)
-    username = find_username_by_chat(chat_id)
-    if not username:
-        bot.send_message(chat_id, "⚠️ no linked SPADA user found.")
+    user = store.find_user("telegram", chat_id)
+    if not user:
+        bot.send_message(chat_id, "⚠️ no linked SPADA user. run /setup first.")
         return
-    flag_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
-    # Prevent pausing indefinitely if already paused indefinitely
-    if os.path.exists(flag_file):
-        bot.send_message(chat_id, "⚠️ you are already paused indefinitely. Use /resume to clear it before pausing again.")
+
+    state, _ = store.get_pause_state(user.username)
+    if state == "indefinite":
+        bot.send_message(chat_id, "⚠️ you're already paused indefinitely. /resume to clear it first.")
         return
-    # Prevent pausing indefinitely if a pause_once flag exists
-    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
-    if once_flags:
-        bot.send_message(chat_id, "⚠️ you have a one-time pause active. Use /resume to clear it before pausing indefinitely.")
+    if state == "once":
+        bot.send_message(chat_id, "⚠️ you have a one-time skip active. /resume to clear it first.")
         return
-    with open(flag_file, "w") as f:
-        f.write("paused")
-    bot.send_message(chat_id, "⏸️ attendance paused indefinitely. use /resume to re-enable.")
+
+    store.set_indefinite_pause(user.username)
+    bot.send_message(chat_id, "⏸️ attendance paused indefinitely. /resume to re-enable.")
+
 
 @bot.message_handler(commands=["resume"])
 def cmd_resume(message):
     chat_id = str(message.chat.id)
-    username = find_username_by_chat(chat_id)
-    if not username:
-        bot.send_message(chat_id, "⚠️ no linked SPADA user found.")
+    user = store.find_user("telegram", chat_id)
+    if not user:
+        bot.send_message(chat_id, "⚠️ no linked SPADA user. run /setup first.")
         return
-    flag_file = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
-    # Remove indefinite pause flag
-    if os.path.exists(flag_file):
-        os.remove(flag_file)
-    # Remove any pause_once flags for this user
-    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
-    for f in once_flags:
-        try:
-            os.remove(os.path.join(FLAG_DIR, f))
-        except Exception:
-            pass
-    bot.send_message(chat_id, "▶️ attendance resumed.")
+
+    store.clear_all_pauses(user.username)
+    bot.send_message(chat_id, "▶️ attendance resumed. i'm on duty again ✅")
+
 
 @bot.message_handler(commands=["pauseonce"])
 def cmd_pauseonce(message):
     chat_id = str(message.chat.id)
-    username = find_username_by_chat(chat_id)
-    schedule_path = find_schedule_path(chat_id)
-    if not username or not schedule_path:
-        bot.send_message(chat_id, "⚠️ no linked SPADA user or schedule.")
+    user = store.find_user("telegram", chat_id)
+    if not user:
+        bot.send_message(chat_id, "⚠️ no linked SPADA user. run /setup first.")
         return
-    # Prevent pausing once if already paused indefinitely
-    indefinite_flag = os.path.join(FLAG_DIR, f"pause_user_{username}.flag")
-    if os.path.exists(indefinite_flag):
-        bot.send_message(chat_id, "⚠️ you are already paused indefinitely. Use /resume to clear it before pausing once.")
+
+    state, _ = store.get_pause_state(user.username)
+    if state == "indefinite":
+        bot.send_message(chat_id, "⚠️ you're paused indefinitely. /resume to clear it first.")
         return
-    # Prevent pausing once if a pause_once flag already exists
-    once_flags = [f for f in os.listdir(FLAG_DIR) if f.startswith(f"pause_once_{username}_")]
-    if once_flags:
-        bot.send_message(chat_id, "⚠️ you already have a one-time pause active. Use /resume to clear it before pausing once again.")
+    if state == "once":
+        bot.send_message(chat_id, "⚠️ you already have a one-time skip active. /resume to clear it first.")
         return
-    next_class = get_next_class(schedule_path)
-    if not next_class:
-        bot.send_message(chat_id, "ℹ️ no upcoming class found to pause.")
+
+    classes = store.upcoming_classes(user.schedule_path)
+    if not classes:
+        bot.send_message(chat_id, "📭 no upcoming classes in your schedule. add one via /schedule.")
         return
-    flag_file = os.path.join(FLAG_DIR, f"pause_once_{username}_{next_class.replace(' ','_')}.flag")
-    with open(flag_file, "w") as f:
-        f.write("skip next")
-    bot.send_message(chat_id, f"⏸️ next class <b>{next_class}</b> will be skipped.")
+
+    shown = classes[:8]
+    pending_skip[chat_id] = [c["course"] for c in shown]
+
+    kb = types.InlineKeyboardMarkup()
+    nxt = shown[0]
+    kb.add(types.InlineKeyboardButton(
+        f"⏭️ next: {short_course_label(nxt['course'], nxt['day'], nxt['time'])}",
+        callback_data="po_0",
+    ))
+    for i, c in enumerate(shown[1:], start=1):
+        kb.add(types.InlineKeyboardButton(
+            short_course_label(c["course"], c["day"], c["time"]),
+            callback_data=f"po_{i}",
+        ))
+
+    bot.send_message(chat_id, "⏭️ which class should i skip?", reply_markup=kb)
+
+
+@bot.message_handler(commands=["schedule"])
+def handle_schedule(message):
+    chat_id = str(message.chat.id)
+    if not store.find_user("telegram", chat_id):
+        bot.send_message(chat_id, "⚠️ run /setup first so i can link your schedule~")
+        return
+    bot.send_message(chat_id, "📌 manage your schedule:", reply_markup=schedule_menu_markup())
+
+
+@bot.message_handler(commands=["cancel"])
+def handle_cancel(message):
+    chat_id = str(message.chat.id)
+    user_states.pop(chat_id, None)
+    user_temp_data.pop(chat_id, None)
+    waiting_upload.discard(chat_id)
+    waiting_upload.discard(f"csv_{chat_id}")
+    pending_csv.pop(chat_id, None)
+    pending_skip.pop(chat_id, None)
+    bot.send_message(chat_id, "❌ cancelled.")
 
 
 # =============================
-# Setup conversation flow
+# Setup / credsedit conversation flow
 # =============================
 @bot.message_handler(func=lambda m: str(m.chat.id) in user_states)
 def handle_conversation(message):
@@ -570,207 +348,295 @@ def handle_conversation(message):
     state = user_states.get(chat_id)
 
     if state == "awaiting_username":
-        user_temp_data[chat_id] = {"mode": "setup", "username": text}
+        user_temp_data[chat_id] = {"username": text}
         user_states[chat_id] = "awaiting_password"
         bot.send_message(
             chat_id,
             "🔐 what's your SPADA password?\n\n"
-            "<b>warning:</b> it’s stored in plain text. use a unique password."
+            "<b>warning:</b> it's stored in plain text. use a unique password.",
         )
     elif state == "awaiting_password":
         user_temp_data[chat_id]["password"] = text
-        save_to_env(chat_id, user_temp_data[chat_id])
+        store.save_user("telegram", chat_id, user_temp_data[chat_id]["username"], text)
         user_states.pop(chat_id, None)
         user_temp_data.pop(chat_id, None)
         bot.send_message(chat_id, "✅ credentials saved!")
-        # gentle reminder to upload schedule
-        bot.send_message(chat_id, "💡 don’t forget to upload your schedule with <b>/schedule</b> → <i>Upload Schedule</i>.")
+        bot.send_message(chat_id, "💡 don't forget to upload your schedule with /schedule → 🖼 Upload Schedule Image.")
     elif state == "changing_username":
-        user_temp_data[chat_id]["username"] = text
+        user_temp_data[chat_id]["new_username"] = text
         user_states[chat_id] = "changing_password"
         bot.send_message(
             chat_id,
             "🔐 send your new SPADA password now.\n\n"
-            "<b>warning:</b> it’s stored in plain text. use a unique password."
+            "<b>warning:</b> it's stored in plain text. use a unique password.",
         )
     elif state == "changing_password":
         user_temp_data[chat_id]["password"] = text
-        if update_credentials(chat_id, user_temp_data[chat_id]):
+        user = store.find_user("telegram", chat_id)
+        if user and store.update_user(user, user_temp_data[chat_id]["new_username"], text):
             bot.send_message(chat_id, "✅ credentials updated.")
         else:
-            bot.send_message(chat_id, "❌ couldn't update your credentials. try /setup if the current record is missing.")
+            bot.send_message(chat_id, "❌ couldn't update your credentials. try /setup if the record is missing.")
         user_states.pop(chat_id, None)
         user_temp_data.pop(chat_id, None)
 
-# =============================
-# Photo handling (Upload flow)
-# =============================
 
-# Handle photo upload (image schedule)
+# =============================
+# Media handling (schedule uploads)
+# =============================
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     chat_id = str(message.chat.id)
 
-    # only accept a photo if user pressed "Upload Schedule" first
     if chat_id not in waiting_upload:
+        bot.send_message(
+            chat_id,
+            "👀 i see a photo! if that's your schedule, press /schedule → 🖼 Upload Schedule Image first "
+            "so i know what to do with it.",
+        )
         return
 
-    if not is_chat_id_exist(chat_id):
+    user = store.find_user("telegram", chat_id)
+    if not user:
         bot.send_message(chat_id, "⚠️ run /setup first before sending your schedule.")
+        waiting_upload.discard(chat_id)
         return
 
-    # get highest-resolution photo
     file_info = bot.get_file(message.photo[-1].file_id)
     image_bytes = bot.download_file(file_info.file_path)
 
-    bot.send_message(chat_id, "⏳ processing your schedule image with Gemini…")
+    bot.send_message(chat_id, "⏳ reading your schedule with Gemini...")
+    waiting_upload.discard(chat_id)
 
     try:
-        csv_text = parse_schedule_with_gemini(image_bytes)
+        csv_text = store.parse_schedule_with_gemini(image_bytes)
         if not csv_text:
             bot.send_message(chat_id, "❌ i couldn't read any schedule from that image. try a clearer shot?")
             return
 
+        csv_text = store.normalize_schedule_csv(csv_text)
+        error = store.validate_schedule_csv(csv_text)
+        if error:
+            bot.send_message(chat_id, f"❌ the extracted schedule doesn't look right — {error}")
+            return
+
         pending_csv[chat_id] = csv_text
-        waiting_upload.discard(chat_id)
-
-        # send CSV preview as a file with Save/Cancel buttons
-        csv_file = io.BytesIO(csv_text.encode("utf-8"))
-        csv_file.name = "schedule_preview.csv"
-        bot.send_document(chat_id, csv_file, caption="📄 here’s what i extracted. save it?", reply_markup=confirm_menu_markup())
-
+        bot.send_message(chat_id, schedule_preview_text(csv_text), reply_markup=confirm_menu_markup())
     except Exception as e:
-        waiting_upload.discard(chat_id)
         bot.send_message(chat_id, f"❌ error parsing schedule: <code>{e}</code>")
 
-# Handle CSV upload
+
 @bot.message_handler(content_types=["document"])
 def handle_csv_upload(message):
     chat_id = str(message.chat.id)
-    # Only accept CSV if user pressed "Upload CSV" first
-    if f"csv_{chat_id}" not in waiting_upload:
+    key = f"csv_{chat_id}"
+
+    if key not in waiting_upload:
+        doc = message.document
+        if doc and doc.file_name and doc.file_name.lower().endswith(".csv"):
+            bot.send_message(
+                chat_id,
+                "👀 got a CSV! press /schedule → ⬆️ Upload CSV first so i know where to put it.",
+            )
         return
-    if not is_chat_id_exist(chat_id):
+
+    user = store.find_user("telegram", chat_id)
+    if not user:
         bot.send_message(chat_id, "⚠️ run /setup first before sending your schedule.")
+        waiting_upload.discard(key)
         return
+
     doc = message.document
     if not doc.file_name.lower().endswith(".csv"):
-        bot.send_message(chat_id, "⚠️ please upload a CSV file.")
+        bot.send_message(chat_id, "⚠️ that's not a CSV file. send a .csv schedule.")
         return
+
     try:
         file_info = bot.get_file(doc.file_id)
-        csv_bytes = bot.download_file(file_info.file_path)
-        csv_text = csv_bytes.decode("utf-8")
-        # Basic validation: must have header and at least one row
-        lines = [l for l in csv_text.strip().splitlines() if l.strip()]
-        if not lines or not lines[0].lower().startswith("coursename,day,time"):
-            bot.send_message(chat_id, "❌ CSV must start with header: CourseName,Day,Time")
-            waiting_upload.discard(f"csv_{chat_id}")
+        csv_text = bot.download_file(file_info.file_path).decode("utf-8")
+
+        error = store.validate_schedule_csv(csv_text)
+        if error:
+            bot.send_message(chat_id, f"❌ {error}")
+            waiting_upload.discard(key)
             return
-        if len(lines) < 2:
-            bot.send_message(chat_id, "❌ CSV must have at least one schedule row.")
-            waiting_upload.discard(f"csv_{chat_id}")
-            return
-        schedule_path = find_schedule_path(chat_id)
-        if not schedule_path:
-            bot.send_message(chat_id, "❌ could not locate your schedule file in .env.")
-            waiting_upload.discard(f"csv_{chat_id}")
-            return
-        with open(schedule_path, "w", encoding="utf-8") as f:
-            f.write(csv_text if csv_text.endswith("\n") else csv_text + "\n")
-        bot.send_message(chat_id, f"✅ schedule CSV uploaded and saved to <code>{schedule_path}</code>")
-        waiting_upload.discard(f"csv_{chat_id}")
+
+        store.save_schedule_csv(user.schedule_path, csv_text)
+        waiting_upload.discard(key)
+        n = len(store.parse_schedule_text(csv_text))
+        bot.send_message(chat_id, f"✅ schedule saved — {n} classes on the list! check it via /schedule → 📄 View Schedule.")
     except Exception as e:
         bot.send_message(chat_id, f"❌ error processing CSV: <code>{e}</code>")
-        waiting_upload.discard(f"csv_{chat_id}")
+        waiting_upload.discard(key)
+
 
 # =============================
-# Callback handlers (Inline buttons)
+# Callback handlers (inline buttons)
 # =============================
-@bot.callback_query_handler(func=lambda c: c.data in ["sch_upload", "sch_upload_csv", "sch_view", "sch_delete", "sch_save", "sch_cancel"])
-def handle_schedule_buttons(call: types.CallbackQuery):
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("sch_", "del_", "po_", "tut_")))
+def handle_callbacks(call: types.CallbackQuery):
     chat_id = str(call.message.chat.id)
     data = call.data
 
-    # ensure user is set up
-    if not is_chat_id_exist(chat_id):
-        bot.answer_callback_query(call.id, "Please run /setup first.")
+    # ---- tutorial navigation ----
+    if data.startswith("tut_"):
+        if data == "tut_done":
+            remove_kb(call)
+            bot.answer_callback_query(call.id, "you're all set! 🎉")
+            return
+        if data == "tut_help":
+            bot.answer_callback_query(call.id)
+            bot.send_message(chat_id, HELP_TEXT)
+            return
+        try:
+            step = int(data.split("_")[1])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id)
+            return
+        if 0 <= step < len(TUTORIAL_STEPS):
+            try:
+                bot.edit_message_text(
+                    TUTORIAL_STEPS[step],
+                    chat_id,
+                    call.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=tutorial_markup(step),
+                )
+            except Exception:
+                pass
+        bot.answer_callback_query(call.id)
         return
 
+    # ---- /pauseonce picker ----
+    if data.startswith("po_"):
+        user = store.find_user("telegram", chat_id)
+        courses = pending_skip.get(chat_id, [])
+        try:
+            course = courses[int(data.split("_")[1])]
+        except (ValueError, IndexError):
+            course = None
 
-    # Upload image request
+        if not user or course is None:
+            remove_kb(call)
+            pending_skip.pop(chat_id, None)
+            bot.answer_callback_query(call.id, "this picker expired — run /pauseonce again.")
+            return
+
+        state, _ = store.get_pause_state(user.username)
+        if state != "active":
+            remove_kb(call)
+            pending_skip.pop(chat_id, None)
+            bot.answer_callback_query(call.id, "a pause is already active — use /resume first.")
+            return
+
+        store.set_once_pause(user.username, course)
+        pending_skip.pop(chat_id, None)
+        remove_kb(call)
+        bot.answer_callback_query(call.id, "done!")
+        bot.send_message(chat_id, f"⏭️ got it — <b>{course}</b> will be skipped. /resume to undo.")
+        return
+
+    # ---- /delete confirmation ----
+    if data in ("del_yes", "del_no"):
+        remove_kb(call)
+        if data == "del_no":
+            bot.answer_callback_query(call.id, "kept!")
+            bot.send_message(chat_id, "phew 😌 nothing was deleted.")
+            return
+        user = store.find_user("telegram", chat_id)
+        if user and store.delete_user(user):
+            bot.answer_callback_query(call.id, "deleted.")
+            bot.send_message(chat_id, "🗑️ credentials, schedule, and flags deleted. /setup anytime to come back.")
+        else:
+            bot.answer_callback_query(call.id, "nothing to delete.")
+        return
+
+    # ---- schedule menu (needs a linked account) ----
+    user = store.find_user("telegram", chat_id)
+    if not user:
+        bot.answer_callback_query(call.id, "please run /setup first.")
+        return
+
     if data == "sch_upload":
         waiting_upload.add(chat_id)
         pending_csv.pop(chat_id, None)
-        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-        bot.answer_callback_query(call.id, "Ready for your image!")
+        remove_kb(call)
+        bot.answer_callback_query(call.id, "ready for your image!")
         bot.send_message(chat_id, "🖼 please send me your <b>schedule image</b> now.")
 
-    # Upload CSV request
     elif data == "sch_upload_csv":
         waiting_upload.add(f"csv_{chat_id}")
         pending_csv.pop(chat_id, None)
-        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-        bot.answer_callback_query(call.id, "Ready for your CSV!")
+        remove_kb(call)
+        bot.answer_callback_query(call.id, "ready for your CSV!")
         bot.send_message(chat_id, "⬆️ please send me your <b>CSV schedule file</b> now.")
 
-    # View current schedule
     elif data == "sch_view":
-        schedule_path = find_schedule_path(chat_id)
-        if not schedule_path or not os.path.exists(schedule_path) or os.path.getsize(schedule_path) == 0:
-            bot.answer_callback_query(call.id, "No schedule saved yet.")
+        rows = store.load_schedule_rows(user.schedule_path)
+        if not rows:
+            bot.answer_callback_query(call.id, "no schedule saved yet.")
             return
-        bot.answer_callback_query(call.id, "Sending your current schedule.")
-        bot.send_document(chat_id, open(schedule_path, "rb"), caption="📄 your current saved schedule.")
+        bot.answer_callback_query(call.id, "sending your current schedule.")
+        with open(user.schedule_path, "rb") as f:
+            data = f.read()
+        bot.send_message(chat_id, schedule_preview_text(data.decode("utf-8"), "your current schedule"))
+        doc = io.BytesIO(data)
+        doc.name = "schedule.csv"
+        bot.send_document(chat_id, doc, caption="📎 raw CSV backup")
 
-    # Delete schedule
     elif data == "sch_delete":
-        schedule_path = find_schedule_path(chat_id)
-        if schedule_path and os.path.exists(schedule_path):
-            try:
-                os.remove(schedule_path)
-                # recreate empty file to keep path valid
-                open(schedule_path, "w", encoding="utf-8").close()
-                bot.answer_callback_query(call.id, "Schedule deleted.")
-                bot.send_message(chat_id, "🗑 schedule deleted.")
-            except Exception as e:
-                bot.answer_callback_query(call.id, "Failed to delete.")
-                bot.send_message(chat_id, f"❌ couldn't delete: <code>{e}</code>")
+        if os.path.exists(user.schedule_path):
+            store.delete_schedule_file(user.schedule_path, recreate_empty=True)
+            bot.answer_callback_query(call.id, "schedule deleted.")
+            bot.send_message(chat_id, "🗑 schedule deleted. upload a new one anytime.")
         else:
-            bot.answer_callback_query(call.id, "No schedule to delete.")
+            bot.answer_callback_query(call.id, "no schedule to delete.")
 
-    # Save parsed CSV
     elif data == "sch_save":
         csv_text = pending_csv.get(chat_id)
         if not csv_text:
-            bot.answer_callback_query(call.id, "Nothing to save.")
-            return
-        schedule_path = find_schedule_path(chat_id)
-        if not schedule_path:
-            bot.answer_callback_query(call.id, "No schedule path in .env.")
-            bot.send_message(chat_id, "❌ couldn't locate your SCHEDULE_FILE in .env.")
+            bot.answer_callback_query(call.id, "nothing to save.")
             return
         try:
-            with open(schedule_path, "w", encoding="utf-8") as f:
-                f.write(csv_text)
+            store.save_schedule_csv(user.schedule_path, csv_text)
             pending_csv.pop(chat_id, None)
-            bot.answer_callback_query(call.id, "Saved!")
-            bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-            bot.send_message(chat_id, f"✅ schedule saved to <code>{schedule_path}</code>")
+            remove_kb(call)
+            bot.answer_callback_query(call.id, "saved!")
+            bot.send_message(chat_id, "✅ schedule saved! check it anytime via /schedule → 📄 View Schedule.")
         except Exception as e:
-            bot.answer_callback_query(call.id, "Save failed.")
+            bot.answer_callback_query(call.id, "save failed.")
             bot.send_message(chat_id, f"❌ failed to save: <code>{e}</code>")
 
-    # Cancel parsed CSV
     elif data == "sch_cancel":
         pending_csv.pop(chat_id, None)
         waiting_upload.discard(chat_id)
-        bot.answer_callback_query(call.id, "Cancelled.")
-        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
-        bot.send_message(chat_id, "❌ schedule upload cancelled. you can try again via <b>/schedule</b>.")
+        remove_kb(call)
+        bot.answer_callback_query(call.id, "cancelled.")
+        bot.send_message(chat_id, "❌ schedule upload cancelled. you can try again via /schedule.")
+
 
 # =============================
 # Run
 # =============================
 if __name__ == "__main__":
+    # register the command palette shown in Telegram's UI (cosmetic; never block startup)
+    try:
+        bot.set_my_commands([
+            types.BotCommand("start", "wake me up / see commands"),
+            types.BotCommand("help", "what i can do"),
+            types.BotCommand("tutorial", "quick start walkthrough"),
+            types.BotCommand("mystatus", "your account & pause status"),
+            types.BotCommand("setup", "link your SPADA account"),
+            types.BotCommand("schedule", "manage your class schedule"),
+            types.BotCommand("pauseonce", "skip an upcoming class"),
+            types.BotCommand("pause", "pause attendance indefinitely"),
+            types.BotCommand("resume", "clear any pause"),
+            types.BotCommand("credscheck", "verify saved credentials"),
+            types.BotCommand("credsedit", "update username/password"),
+            types.BotCommand("delete", "remove your account"),
+            types.BotCommand("cancel", "cancel current action"),
+        ])
+    except Exception:
+        pass
+
     bot.infinity_polling()
